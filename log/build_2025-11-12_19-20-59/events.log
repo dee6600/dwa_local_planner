@@ -1,0 +1,41 @@
+[0.000000] (-) TimerEvent: {}
+[0.000476] (dwa_local_planner) JobQueued: {'identifier': 'dwa_local_planner', 'dependencies': OrderedDict()}
+[0.000504] (dwa_local_planner) JobStarted: {'identifier': 'dwa_local_planner'}
+[0.099434] (-) TimerEvent: {}
+[0.199669] (-) TimerEvent: {}
+[0.299938] (-) TimerEvent: {}
+[0.400167] (-) TimerEvent: {}
+[0.500400] (-) TimerEvent: {}
+[0.600820] (-) TimerEvent: {}
+[0.701254] (-) TimerEvent: {}
+[0.796128] (dwa_local_planner) Command: {'cmd': ['/usr/bin/python3', '-W', 'ignore:setup.py install is deprecated', '-W', 'ignore:easy_install command is deprecated', 'setup.py', 'develop', '--editable', '--build-directory', '/home/dee/ros2_ws/build/dwa_local_planner/build', '--no-deps', 'symlink_data'], 'cwd': '/home/dee/ros2_ws/build/dwa_local_planner', 'env': {'LESSOPEN': '| /usr/bin/lesspipe %s', 'LANGUAGE': 'en_IN:en', 'USER': 'dee', 'SSH_CLIENT': '192.168.1.9 56032 22', 'XDG_SESSION_TYPE': 'tty', 'GIT_ASKPASS': '/home/dee/.vscode-server/cli/servers/Stable-7d842fb85a0275a4a8e4d7e040d2625abbf7f084/server/extensions/git/dist/askpass.sh', 'SHLVL': '2', 'LD_LIBRARY_PATH': '/usr/lib/x86_64-linux-gnu/gazebo-11/plugins:/opt/ros/humble/opt/rviz_ogre_vendor/lib:/opt/ros/humble/lib/x86_64-linux-gnu:/opt/ros/humble/lib', 'BROWSER': '/home/dee/.vscode-server/cli/servers/Stable-7d842fb85a0275a4a8e4d7e040d2625abbf7f084/server/bin/helpers/browser.sh', 'MOTD_SHOWN': 'pam', 'HOME': '/home/dee', 'OLDPWD': '/home/dee/ros2_ws', 'TERM_PROGRAM_VERSION': '1.105.1', 'VSCODE_IPC_HOOK_CLI': '/run/user/1000/vscode-ipc-f44893ed-ed07-4227-8e4f-ef7f945e057d.sock', 'ROS_PYTHON_VERSION': '3', 'VSCODE_GIT_ASKPASS_MAIN': '/home/dee/.vscode-server/cli/servers/Stable-7d842fb85a0275a4a8e4d7e040d2625abbf7f084/server/extensions/git/dist/askpass-main.js', 'VSCODE_GIT_ASKPASS_NODE': '/home/dee/.vscode-server/cli/servers/Stable-7d842fb85a0275a4a8e4d7e040d2625abbf7f084/server/node', 'SSL_CERT_FILE': '/usr/lib/ssl/certs/ca-certificates.crt', 'VSCODE_PYTHON_AUTOACTIVATE_GUARD': '1', 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus', 'COLORTERM': 'truecolor', 'COLCON_PREFIX_PATH': '/home/dee/ros2_ws/install', 'ROS_DISTRO': 'humble', 'LOGNAME': 'dee', '_': '/usr/bin/colcon', 'ROS_VERSION': '2', 'XDG_SESSION_CLASS': 'user', 'TERM': 'xterm-256color', 'XDG_SESSION_ID': '4', 'ROS_LOCALHOST_ONLY': '0', 'PATH': '/opt/ros/humble/bin:/home/dee/.vscode-server/cli/servers/Stable-7d842fb85a0275a4a8e4d7e040d2625abbf7f084/server/bin/remote-cli:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/dee/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand', 'XDG_RUNTIME_DIR': '/run/user/1000', 'SSL_CERT_DIR': '/usr/lib/ssl/certs', 'LANG': 'en_US.UTF-8', 'LS_COLORS': 'rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arc=01;31:*.arj=01;31:*.taz=01;31:*.lha=01;31:*.lz4=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.tzo=01;31:*.t7z=01;31:*.zip=01;31:*.z=01;31:*.dz=01;31:*.gz=01;31:*.lrz=01;31:*.lz=01;31:*.lzo=01;31:*.xz=01;31:*.zst=01;31:*.tzst=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.cab=01;31:*.wim=01;31:*.swm=01;31:*.dwm=01;31:*.esd=01;31:*.jpg=01;35:*.jpeg=01;35:*.mjpg=01;35:*.mjpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.webp=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.m4a=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:*.oga=00;36:*.opus=00;36:*.spx=00;36:*.xspf=00;36:', 'VSCODE_GIT_IPC_HANDLE': '/run/user/1000/vscode-git-3fd5e8e703.sock', 'TERM_PROGRAM': 'vscode', 'AMENT_PREFIX_PATH': '/opt/ros/humble', 'SHELL': '/bin/bash', 'LESSCLOSE': '/usr/bin/lesspipe %s %s', 'VSCODE_GIT_ASKPASS_EXTRA_ARGS': '', 'PWD': '/home/dee/ros2_ws/build/dwa_local_planner', 'TURTLEBOT3_MODEL': 'burger', 'SSH_CONNECTION': '192.168.1.9 56032 192.168.1.10 22', 'XDG_DATA_DIRS': '/usr/share/gnome:/usr/local/share:/usr/share:/var/lib/snapd/desktop', 'PYTHONPATH': '/home/dee/ros2_ws/build/dwa_local_planner/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/dee/ros2_ws/install/dwa_local_planner/lib/python3.10/site-packages:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages', 'COLCON': '1'}, 'shell': False}
+[0.801346] (-) TimerEvent: {}
+[0.901564] (-) TimerEvent: {}
+[1.001804] (-) TimerEvent: {}
+[1.022904] (dwa_local_planner) StdoutLine: {'line': b'running develop\n'}
+[1.101914] (-) TimerEvent: {}
+[1.170325] (dwa_local_planner) StdoutLine: {'line': b'running egg_info\n'}
+[1.170484] (dwa_local_planner) StdoutLine: {'line': b'creating dwa_local_planner.egg-info\n'}
+[1.170655] (dwa_local_planner) StdoutLine: {'line': b'writing dwa_local_planner.egg-info/PKG-INFO\n'}
+[1.170938] (dwa_local_planner) StdoutLine: {'line': b'writing dependency_links to dwa_local_planner.egg-info/dependency_links.txt\n'}
+[1.171076] (dwa_local_planner) StdoutLine: {'line': b'writing entry points to dwa_local_planner.egg-info/entry_points.txt\n'}
+[1.171156] (dwa_local_planner) StdoutLine: {'line': b'writing requirements to dwa_local_planner.egg-info/requires.txt\n'}
+[1.171228] (dwa_local_planner) StdoutLine: {'line': b'writing top-level names to dwa_local_planner.egg-info/top_level.txt\n'}
+[1.171314] (dwa_local_planner) StdoutLine: {'line': b"writing manifest file 'dwa_local_planner.egg-info/SOURCES.txt'\n"}
+[1.172526] (dwa_local_planner) StdoutLine: {'line': b"reading manifest file 'dwa_local_planner.egg-info/SOURCES.txt'\n"}
+[1.173114] (dwa_local_planner) StdoutLine: {'line': b"writing manifest file 'dwa_local_planner.egg-info/SOURCES.txt'\n"}
+[1.174097] (dwa_local_planner) StdoutLine: {'line': b'running build_ext\n'}
+[1.174292] (dwa_local_planner) StdoutLine: {'line': b'Creating /home/dee/ros2_ws/install/dwa_local_planner/lib/python3.10/site-packages/dwa-local-planner.egg-link (link to .)\n'}
+[1.174933] (dwa_local_planner) StdoutLine: {'line': b'Installing dwa_node script to /home/dee/ros2_ws/install/dwa_local_planner/lib/dwa_local_planner\n'}
+[1.175136] (dwa_local_planner) StdoutLine: {'line': b'\n'}
+[1.175379] (dwa_local_planner) StdoutLine: {'line': b'Installed /home/dee/ros2_ws/build/dwa_local_planner\n'}
+[1.175497] (dwa_local_planner) StdoutLine: {'line': b'running symlink_data\n'}
+[1.175599] (dwa_local_planner) StdoutLine: {'line': b'creating /home/dee/ros2_ws/install/dwa_local_planner/share/ament_index\n'}
+[1.175700] (dwa_local_planner) StdoutLine: {'line': b'creating /home/dee/ros2_ws/install/dwa_local_planner/share/ament_index/resource_index\n'}
+[1.175758] (dwa_local_planner) StdoutLine: {'line': b'creating /home/dee/ros2_ws/install/dwa_local_planner/share/ament_index/resource_index/packages\n'}
+[1.175816] (dwa_local_planner) StdoutLine: {'line': b'symbolically linking /home/dee/ros2_ws/build/dwa_local_planner/resource/dwa_local_planner -> /home/dee/ros2_ws/install/dwa_local_planner/share/ament_index/resource_index/packages\n'}
+[1.175869] (dwa_local_planner) StdoutLine: {'line': b'symbolically linking /home/dee/ros2_ws/build/dwa_local_planner/package.xml -> /home/dee/ros2_ws/install/dwa_local_planner/share/dwa_local_planner\n'}
+[1.195992] (dwa_local_planner) CommandEnded: {'returncode': 0}
+[1.202810] (-) TimerEvent: {}
+[1.205640] (dwa_local_planner) JobEnded: {'identifier': 'dwa_local_planner', 'rc': 0}
+[1.206305] (-) EventReactorShutdown: {}
