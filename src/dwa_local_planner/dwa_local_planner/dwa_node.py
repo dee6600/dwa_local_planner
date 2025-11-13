@@ -53,25 +53,25 @@ class DWAConfig:
     """
     def __init__(self):
         # Robot kinematic limits (adjust based on your robot specs)
-        self.max_speed = 0.22           # Maximum linear velocity (m/s)
-        self.min_speed = -0.1           # Minimum linear velocity (m/s) - allow slight reverse
-        self.max_yaw_rate = 2.0         # Maximum angular velocity (rad/s)
-        self.max_accel = 2.0            # Maximum linear acceleration (m/s^2) - increased for responsiveness
-        self.max_delta_yaw_rate = 3.0   # Maximum angular acceleration (rad/s^2) - increased for sharper turns
+        self.max_speed = 0.12           # Maximum linear velocity (m/s)
+        self.min_speed = -0.15          # Minimum linear velocity (m/s) - allow more reverse
+        self.max_yaw_rate = 2.0        # Maximum angular velocity (rad/s) - TurtleBot3 max
+        self.max_accel = 2.0            # Maximum linear acceleration (m/s^2) - very responsive
+        self.max_delta_yaw_rate = 1.0   # Maximum angular acceleration (rad/s^2) - fast rotation
         
         # Sampling resolution (finer = more accurate but slower)
-        self.v_res = 0.01               # Linear velocity sampling resolution (m/s)
-        self.yaw_res = 0.1              # Angular velocity sampling resolution (rad/s)
+        self.v_res = 0.02               # Linear velocity sampling resolution (m/s)
+        self.yaw_res = 0.15             # Angular velocity sampling resolution (rad/s) - coarser for speed
         
         # Prediction parameters
         self.predict_time = 2.0         # Trajectory prediction horizon (seconds)
         self.dt = 0.1                   # Time step for trajectory prediction (seconds)
         
         # Cost function weights - TUNE THESE FOR BEST PERFORMANCE
-        self.heading_weight = 1.5       # Weight for heading toward goal - increased
-        self.clearance_weight = 2.5     # Weight for obstacle clearance (higher = more cautious)
-        self.velocity_weight = 0.5      # Weight for forward velocity - reduced to allow more rotation
-        self.rotation_weight = 4.0      # Weight for rotation when path is blocked
+        self.heading_weight = 2.5       # Weight for heading toward goal - MUCH higher for aggressive path following
+        self.clearance_weight = 1.5     # Weight for obstacle clearance - reduced to be less timid
+        self.velocity_weight = 0.6      # Weight for forward velocity
+        self.rotation_weight = 1.5      # Weight for rotation when path is blocked - increased
         
         # Safety parameters
         self.robot_radius = 0.22        # Robot radius for collision checking (meters)
@@ -97,10 +97,10 @@ class DWALocalPlanner(Node):
         self.config = DWAConfig()
         
         # Goal and path following
-        self.final_goal = np.array([2.0, 0.0])  # Final goal position
+        self.final_goal = np.array([2.0, 1.0])  # Final goal position
         self.global_path = None       # Global path from planner
         self.local_goal = None        # Current local waypoint to follow
-        self.lookahead_dist = 1.0     # Distance to look ahead on path
+        self.lookahead_dist = 0.2     # Distance to look ahead on path - reduced for tighter following
         
         # Recovery/stuck detection
         self.stuck_counter = 0        # Counts control loops with low velocity
@@ -402,7 +402,7 @@ class DWALocalPlanner(Node):
         twist.angular.z = float(w)
         self.cmd_pub.publish(twist)
     
-    def is_forward_blocked(self, check_angle=math.pi/6, check_dist=0.05):
+    def is_forward_blocked(self, check_angle=math.pi/6, check_dist=0.6):
         """Check if the forward path is blocked by obstacles.
         
         Args:
@@ -504,15 +504,15 @@ class DWALocalPlanner(Node):
                 
                 # If forward is blocked, strongly favor rotation
                 if forward_blocked:
-                    # Penalize forward motion, reward rotation
+                    # Penalize forward motion, strongly reward rotation
                     rotation_bonus = abs(w) / self.config.max_yaw_rate
                     forward_penalty = max(0, v) / self.config.max_speed
                     
                     total_score = (
                         self.config.heading_weight * heading_cost +
                         self.config.clearance_weight * clearance_cost +
-                        self.config.rotation_weight * rotation_bonus -
-                        0.5 * forward_penalty
+                        self.config.rotation_weight * 2.0 * rotation_bonus -  # Double rotation reward
+                        1.5 * forward_penalty  # Stronger forward penalty
                     )
                 else:
                     # Normal operation: prefer forward motion
@@ -669,12 +669,16 @@ class DWALocalPlanner(Node):
         current_dist_to_goal = np.linalg.norm(goal_to_use - self.pose[:2])
         progress = max(0, current_dist_to_goal - dist_to_goal)
         
-        # Cost components
+        # Cost components with aggressive weighting
         dist_cost = 1.0 - min(dist_to_goal / 10.0, 1.0)  # Closer is better
-        heading_cost = 1.0 - (heading_error / math.pi)   # Better alignment is better
-        progress_cost = min(progress * 2.0, 1.0)         # Making progress is good
         
-        return dist_cost + heading_cost + progress_cost
+        # Exponentially reward good heading alignment (strongly penalize misalignment)
+        heading_cost = math.exp(-3.0 * heading_error)     # Exponential: small error = high reward
+        
+        progress_cost = min(progress * 3.0, 1.0)          # Strongly reward progress
+        
+        # Weight heading alignment most heavily
+        return dist_cost + 2.0 * heading_cost + progress_cost
     
     def calc_clearance_cost(self, trajectory):
         """Calculate cost based on clearance from obstacles.

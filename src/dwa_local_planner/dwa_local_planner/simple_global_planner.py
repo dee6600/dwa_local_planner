@@ -48,7 +48,7 @@ class SimpleGlobalPlanner(Node):
         self.grid_pub = self.create_publisher(OccupancyGrid, '/costmap', 10)
         
         # Timer to replan
-        self.create_timer(2.0, self.plan_path)
+        self.create_timer(3.0, self.plan_path)  # Replan every 3 seconds
         
         self.get_logger().info('Simple Global Planner started')
         self.get_logger().info('Send goal to /goal_pose to trigger planning')
