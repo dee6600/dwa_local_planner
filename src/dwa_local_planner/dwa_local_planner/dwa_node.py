@@ -53,11 +53,11 @@ class DWAConfig:
     """
     def __init__(self):
         # Robot kinematic limits (adjust based on your robot specs)
-        self.max_speed = 0.12           # Maximum linear velocity (m/s)
+        self.max_speed = 0.15           # Maximum linear velocity (m/s)
         self.min_speed = -0.15          # Minimum linear velocity (m/s) - allow more reverse
-        self.max_yaw_rate = 2.0        # Maximum angular velocity (rad/s) - TurtleBot3 max
-        self.max_accel = 2.0            # Maximum linear acceleration (m/s^2) - very responsive
-        self.max_delta_yaw_rate = 1.0   # Maximum angular acceleration (rad/s^2) - fast rotation
+        self.max_yaw_rate = 0.4        # Maximum angular velocity (rad/s) - TurtleBot3 max
+        self.max_accel = 1.0            # Maximum linear acceleration (m/s^2) - very responsive
+        self.max_delta_yaw_rate = 0.1   # Maximum angular acceleration (rad/s^2) - fast rotation
         
         # Sampling resolution (finer = more accurate but slower)
         self.v_res = 0.02               # Linear velocity sampling resolution (m/s)
@@ -65,11 +65,11 @@ class DWAConfig:
         
         # Prediction parameters
         self.predict_time = 2.0         # Trajectory prediction horizon (seconds)
-        self.dt = 0.1                   # Time step for trajectory prediction (seconds)
+        self.dt = 0.5                   # Time step for trajectory prediction (seconds)
         
         # Cost function weights - TUNE THESE FOR BEST PERFORMANCE
         self.heading_weight = 2.5       # Weight for heading toward goal - MUCH higher for aggressive path following
-        self.clearance_weight = 1.5     # Weight for obstacle clearance - reduced to be less timid
+        self.clearance_weight = 2.0     # Weight for obstacle clearance - reduced to be less timid
         self.velocity_weight = 0.6      # Weight for forward velocity
         self.rotation_weight = 1.5      # Weight for rotation when path is blocked - increased
         
@@ -104,7 +104,7 @@ class DWALocalPlanner(Node):
         
         # Recovery/stuck detection
         self.stuck_counter = 0        # Counts control loops with low velocity
-        self.stuck_threshold = 20     # Loops before considering stuck (2 seconds at 10Hz)
+        self.stuck_threshold = 50     # Loops before considering stuck (2 seconds at 10Hz)
         self.recovery_mode = False    # Whether in recovery mode
         self.last_position = None     # Track position for stuck detection
         self.position_history = []    # Recent positions for stuck detection
@@ -402,7 +402,7 @@ class DWALocalPlanner(Node):
         twist.angular.z = float(w)
         self.cmd_pub.publish(twist)
     
-    def is_forward_blocked(self, check_angle=math.pi/6, check_dist=0.6):
+    def is_forward_blocked(self, check_angle=math.pi/6, check_dist=0.01):
         """Check if the forward path is blocked by obstacles.
         
         Args:
