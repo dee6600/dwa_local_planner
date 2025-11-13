@@ -1,764 +1,432 @@
 #!/usr/bin/env python3
-"""Dynamic Window Approach (DWA) Local Planner for ROS 2.
-
-This module implements a DWA-based local planner for differential drive robots.
-It computes collision-free velocity commands by:
-1. Computing a dynamic window of feasible velocities
-2. Sampling candidate trajectories within this window
-3. Evaluating trajectories based on goal heading, clearance, and velocity
-4. Selecting and publishing the optimal velocity command
 """
+Simple DWA local planner (ROS 2, rclpy)
+
+- Subscribes:
+    /odom  (nav_msgs/Odometry)
+    /scan  (sensor_msgs/LaserScan)
+- Publishes:
+    /cmd_vel            (geometry_msgs/Twist)
+    /dwa/trajectories   (visualization_msgs/Marker)  -> all sampled trajectories (faint)
+    /dwa/best_trajectory (visualization_msgs/Marker) -> chosen trajectory (bright)
+Parameters (declared - tune with ros2 param set):
+    max_vel_x, min_vel_x, max_yaw_rate, max_acc_x, max_acc_yaw,
+    v_resolution, omega_resolution, predict_time, dt,
+    robot_radius, obstacle_inflation, min_obstacle_dist,
+    to_goal_cost_gain, speed_cost_gain, obstacle_cost_gain,
+    control_rate, goal_x, goal_y, goal_tolerance
+"""
+import math
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, PoseStamped
-from nav_msgs.msg import Odometry, Path
+
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-import numpy as np
-import math
+from geometry_msgs.msg import Twist, Point
+from visualization_msgs.msg import Marker
+from tf_transformations import euler_from_quaternion
 
+# ---------- Utility state container ----------
+class State:
+    def __init__(self, x=0.0, y=0.0, yaw=0.0, v=0.0, omega=0.0):
+        self.x = x
+        self.y = y
+        self.yaw = yaw
+        self.v = v
+        self.omega = omega
 
-def angle_normalize(x):
-    """Normalize angle to [-pi, pi]."""
-    return math.atan2(math.sin(x), math.cos(x))
-
-
-class DWAConfig:
-    """Configuration parameters for DWA planner.
-    
-    Tuning Guide:
-    -------------
-    Robot Kinematic Limits:
-    - max_speed: Reduce if robot overshoots or is unstable (default: 0.22 m/s)
-    - min_speed: Allow small negative for backing up, but keep small (default: -0.1 m/s)
-    - max_yaw_rate: Higher allows sharper turns but may cause instability (default: 2.0 rad/s)
-    - max_accel/max_delta_yaw_rate: Lower for smoother motion (default: 0.5, 1.5)
-    
-    Sampling Resolution:
-    - v_res: Smaller = more samples, slower computation (default: 0.01 m/s)
-    - yaw_res: Smaller = finer angular resolution (default: 0.1 rad/s)
-    
-    Prediction:
-    - predict_time: Longer horizon = more foresight but slower (default: 2.0 s)
-    - dt: Simulation time step, match control loop rate (default: 0.1 s)
-    
-    Cost Function Weights (most important for tuning!):
-    - heading_weight: Higher = more aggressive toward goal (default: 1.0)
-    - clearance_weight: Higher = more cautious obstacle avoidance (default: 1.5)
-    - velocity_weight: Higher = prefers faster motion (default: 0.8)
-    
-    Safety:
-    - robot_radius: Should match or slightly exceed actual robot size (default: 0.22 m)
-    - safety_margin: Extra clearance for obstacles (default: 0.1 m)
-    - min_obstacle_dist: Stop if obstacle closer than this (default: 0.25 m)
-    """
+# ---------- DWA Node ----------
+class SimpleDWA(Node):
     def __init__(self):
-        # Robot kinematic limits (adjust based on your robot specs)
-        self.max_speed = 0.15           # Maximum linear velocity (m/s)
-        self.min_speed = -0.15          # Minimum linear velocity (m/s) - allow more reverse
-        self.max_yaw_rate = 0.4        # Maximum angular velocity (rad/s) - TurtleBot3 max
-        self.max_accel = 1.0            # Maximum linear acceleration (m/s^2) - very responsive
-        self.max_delta_yaw_rate = 0.1   # Maximum angular acceleration (rad/s^2) - fast rotation
-        
-        # Sampling resolution (finer = more accurate but slower)
-        self.v_res = 0.02               # Linear velocity sampling resolution (m/s)
-        self.yaw_res = 0.15             # Angular velocity sampling resolution (rad/s) - coarser for speed
-        
-        # Prediction parameters
-        self.predict_time = 2.0         # Trajectory prediction horizon (seconds)
-        self.dt = 0.5                   # Time step for trajectory prediction (seconds)
-        
-        # Cost function weights - TUNE THESE FOR BEST PERFORMANCE
-        self.heading_weight = 2.5       # Weight for heading toward goal - MUCH higher for aggressive path following
-        self.clearance_weight = 2.0     # Weight for obstacle clearance - reduced to be less timid
-        self.velocity_weight = 0.6      # Weight for forward velocity
-        self.rotation_weight = 1.5      # Weight for rotation when path is blocked - increased
-        
-        # Safety parameters
-        self.robot_radius = 0.22        # Robot radius for collision checking (meters)
-        self.safety_margin = 0.05       # Additional safety margin (meters) - reduced for better mobility
-        self.min_obstacle_dist = 0.15   # Emergency stop distance (meters) - very close only
+        super().__init__('simple_dwa')
 
-
-class DWALocalPlanner(Node):
-    """DWA Local Planner Node.
-    
-    Subscribes to:
-    - /odom: Robot odometry (position and velocity)
-    - /scan: Laser scan data for obstacle detection
-    
-    Publishes to:
-    - /cmd_vel: Velocity commands (Twist)
-    """
-    
-    def __init__(self):
-        super().__init__('dwa_local_planner')
-        
-        # Load configuration
-        self.config = DWAConfig()
-        
-        # Goal and path following
-        self.final_goal = np.array([2.0, 1.0])  # Final goal position
-        self.global_path = None       # Global path from planner
-        self.local_goal = None        # Current local waypoint to follow
-        self.lookahead_dist = 0.2     # Distance to look ahead on path - reduced for tighter following
-        
-        # Recovery/stuck detection
-        self.stuck_counter = 0        # Counts control loops with low velocity
-        self.stuck_threshold = 50     # Loops before considering stuck (2 seconds at 10Hz)
-        self.recovery_mode = False    # Whether in recovery mode
-        self.last_position = None     # Track position for stuck detection
-        self.position_history = []    # Recent positions for stuck detection
-        self.no_path_counter = 0      # Counts loops without valid path
-        self.no_path_threshold = 30   # Loops before recovery (3 seconds)
-        
-        # Robot state
-        self.pose = None              # Current pose [x, y, yaw]
-        self.vel = [0.0, 0.0]         # Current velocity [v, w]
-        self.scan = None              # Latest laser scan data
-        self.scan_angle_min = None
-        self.scan_angle_increment = None
-        
-        # ROS 2 interfaces
+        # subscriptions
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
-        self.create_subscription(Path, '/plan', self.path_cb, 10)
-        self.create_subscription(PoseStamped, '/goal_pose', self.goal_cb, 10)
+
+        # publishers
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.goal_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
-        
-        # Control loop timer
-        self.create_timer(self.config.dt, self.control_loop)
-        
-        self.get_logger().info('DWA Local Planner initialized')
-        self.get_logger().info(f'Final goal: [{self.final_goal[0]:.2f}, {self.final_goal[1]:.2f}]')
-        self.get_logger().info('Waiting for global path on /plan topic...')
-        self.get_logger().info('Or send goal to /goal_pose to trigger planning')
+        self.traj_pub = self.create_publisher(Marker, '/dwa/trajectories', 10)
+        self.best_pub = self.create_publisher(Marker, '/dwa/best_trajectory', 10)
 
-    def odom_cb(self, msg):
-        """Odometry callback - updates robot pose and velocity."""
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-        
-        # Extract yaw from quaternion
-        q = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        
-        # Extract velocities
-        v = msg.twist.twist.linear.x
-        w = msg.twist.twist.angular.z
-        
-        self.pose = np.array([x, y, yaw])
-        self.vel = [v, w]
+        # declare tunable parameters (defaults chosen comparable to TurtleBot)
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('max_vel_x', 0.18),                    # maximum forward speed (m/s)
+                ('min_vel_x', -0.05),                   # minimum speed / reverse limit (m/s)
+                ('max_yaw_rate', 1.0),                  # maximum rotation rate (rad/s)
+                ('max_acc_x', 0.2),                     # maximum linear acceleration (m/s²)
+                ('max_acc_yaw', 0.5),                   # maximum angular acceleration (rad/s²)
+                ('v_resolution', 0.02),                 # linear velocity sampling step (m/s)
+                ('omega_resolution', 0.1),              # angular velocity sampling step (rad/s)
+                ('predict_time', 1.8),                  # trajectory lookahead horizon (s)
+                ('dt', 0.1),                            # integration timestep (s)
+                ('robot_radius', 0.22),                 # robot body radius (m)
+                ('obstacle_inflation', 0.05),           # safety margin around obstacles (m)
+                ('min_obstacle_dist', 0.05),            # minimum safe clearance distance (m)
+                ('to_goal_cost_gain', 0.5),             # goal attraction weight (higher = prioritize goal)
+                ('speed_cost_gain', 0.5),               # speed preference weight (higher = prefer faster)
+                ('obstacle_cost_gain', 2.0),            # obstacle avoidance weight (higher = stronger avoidance)
+                ('control_rate', 10.0),                 # control loop frequency (Hz)
+                ('goal_x', 2.0),                        # goal x-coordinate (m, in odom frame)
+                ('goal_y', 1.0),                        # goal y-coordinate (m, in odom frame)
+                ('goal_tolerance', 0.12),               # distance to goal considered reached (m)
+            ])
 
-    def scan_cb(self, msg):
-        """Laser scan callback - updates obstacle data."""
-        # Convert to numpy and handle invalid values
-        ranges = np.array(msg.ranges)
-        ranges[np.isnan(ranges)] = msg.range_max
-        ranges[np.isinf(ranges)] = msg.range_max
-        
-        self.scan = ranges
-        self.scan_angle_min = msg.angle_min
-        self.scan_angle_increment = msg.angle_increment
-        self.scan_range_max = msg.range_max
-    
-    def path_cb(self, msg):
-        """Path callback - receives global path from planner."""
-        if len(msg.poses) > 0:
-            self.global_path = msg
-            self.get_logger().info(
-                f'Received global path with {len(msg.poses)} waypoints',
-                once=True
-            )
-    
-    def goal_cb(self, msg):
-        """Goal callback - receives new goal pose."""
-        self.final_goal = np.array([
-            msg.pose.position.x,
-            msg.pose.position.y
+        # read params into locals
+        self.read_params()
+
+        # internal state and sensor data
+        self.state = State()                    # current robot pose (x, y, yaw) and velocities (v, omega)
+        self.scan_msg = None                    # latest LaserScan message from /scan subscription
+        self.scan_pts_world = []                # precomputed scan points in world (odom) frame; transformed each time /scan arrives
+        self.goal = (self.goal_x, self.goal_y) # target goal position (x, y) updated when goal_x/goal_y params change
+        self.goal_reached = False               # flag indicating whether robot has reached the goal
+
+        # control timer
+        self.create_timer(1.0 / self.control_rate, self.control_loop)
+
+        self.get_logger().info('Simple DWA node started.')
+
+    def read_params(self):
+        """
+        Fetch all ROS2 parameters and convert to instance variables.
+        Called at startup and in each control loop to support dynamic reconfiguration.
+        """
+        p = self.get_parameters([
+            'max_vel_x', 'min_vel_x', 'max_yaw_rate', 'max_acc_x', 'max_acc_yaw',
+            'v_resolution', 'omega_resolution', 'predict_time', 'dt', 'robot_radius',
+            'obstacle_inflation', 'min_obstacle_dist', 'to_goal_cost_gain', 'speed_cost_gain',
+            'obstacle_cost_gain', 'control_rate', 'goal_x', 'goal_y', 'goal_tolerance'
         ])
-        self.get_logger().info(f'New goal received: [{self.final_goal[0]:.2f}, {self.final_goal[1]:.2f}]')
+        d = {x.name: x.value for x in p}
 
+        self.max_vel_x = float(d['max_vel_x'])              # maximum forward speed (m/s)
+        self.min_vel_x = float(d['min_vel_x'])              # minimum speed / reverse limit (m/s)
+        self.max_yaw_rate = float(d['max_yaw_rate'])        # maximum rotation rate (rad/s)
+        self.max_acc_x = float(d['max_acc_x'])              # maximum linear acceleration (m/s²)
+        self.max_acc_yaw = float(d['max_acc_yaw'])          # maximum angular acceleration (rad/s²)
+        self.v_resolution = float(d['v_resolution'])        # linear velocity sampling step (m/s)
+        self.omega_resolution = float(d['omega_resolution']) # angular velocity sampling step (rad/s)
+        self.predict_time = float(d['predict_time'])        # trajectory lookahead horizon (s)
+        self.dt = float(d['dt'])                            # integration timestep (s)
+        self.robot_radius = float(d['robot_radius'])        # robot body radius (m)
+        self.obstacle_inflation = float(d['obstacle_inflation']) # safety margin around obstacles (m)
+        self.min_obstacle_dist = float(d['min_obstacle_dist']) # minimum safe clearance distance (m)
+        self.to_goal_cost_gain = float(d['to_goal_cost_gain'])       # goal attraction weight
+        self.speed_cost_gain = float(d['speed_cost_gain'])           # speed preference weight
+        self.obstacle_cost_gain = float(d['obstacle_cost_gain'])     # obstacle avoidance weight
+        self.control_rate = float(d['control_rate'])        # control loop frequency (Hz)
+        self.goal_x = float(d['goal_x'])                    # goal x-coordinate (m, in odom frame)
+        self.goal_y = float(d['goal_y'])                    # goal y-coordinate (m, in odom frame)
+        self.goal_tolerance = float(d['goal_tolerance'])    # distance to goal considered reached (m)
+
+    # ---------- callbacks ----------
+    def odom_cb(self, msg: Odometry):
+        # update robot pose & velocities
+        p = msg.pose.pose.position
+        o = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([o.x, o.y, o.z, o.w])
+        self.state.x = p.x
+        self.state.y = p.y
+        self.state.yaw = yaw
+        self.state.v = msg.twist.twist.linear.x
+        self.state.omega = msg.twist.twist.angular.z
+
+    def scan_cb(self, msg: LaserScan):
+        # store scan and precompute scan points in world coordinates using current odom (important!)
+        self.scan_msg = msg
+        self.scan_pts_world = []  # reset
+        if self.state is None:
+            return
+
+        angle = msg.angle_min
+        sx = self.state.x
+        sy = self.state.y
+        syaw = self.state.yaw
+
+        for r in msg.ranges:
+            # skip invalid ranges
+            if r is None or math.isinf(r) or math.isnan(r) or r <= 0.0:
+                angle += msg.angle_increment
+                continue
+            # point in robot frame
+            px_r = r * math.cos(angle)
+            py_r = r * math.sin(angle)
+            # transform to world (odom) frame using current robot pose
+            px_w = sx + math.cos(syaw) * px_r - math.sin(syaw) * py_r
+            py_w = sy + math.sin(syaw) * px_r + math.cos(syaw) * py_r
+            self.scan_pts_world.append((px_w, py_w, r))
+            angle += msg.angle_increment
+
+    # ---------- control loop ----------
     def control_loop(self):
-        """Main control loop - runs at configured rate (default 10 Hz)."""
-        # Wait for valid sensor data
-        if self.pose is None or self.scan is None:
-            self.get_logger().warn('Waiting for sensor data...', throttle_duration_sec=2.0)
+        # refresh parameters in-case changed at runtime
+        self.read_params()
+
+        # if data missing or goal reached, stop
+        if self.scan_msg is None or self.state is None:
             return
-        
-        # Update local goal from path or use final goal
-        if self.global_path is not None and len(self.global_path.poses) > 0:
-            self.local_goal = self.get_local_goal_from_path()
-            self.no_path_counter = 0  # Reset counter
-        else:
-            # No path available
-            self.no_path_counter += 1
-            
-            if self.no_path_counter > self.no_path_threshold:
-                # No path for too long, trigger recovery
-                self.get_logger().warn(
-                    'No global path for 3 seconds, triggering recovery',
-                    throttle_duration_sec=3.0
-                )
-                self.recovery_mode = True
-                return
-            
-            # Use final goal temporarily
-            self.local_goal = self.final_goal
-            self.get_logger().warn(
-                'No global path available, heading directly to goal',
-                throttle_duration_sec=5.0
-            )
-        
-        # Check if we've reached the final goal
-        dist_to_final_goal = np.linalg.norm(self.final_goal - self.pose[:2])
-        if dist_to_final_goal < 0.2:  # Goal tolerance
-            self.get_logger().info('Final goal reached!', once=True)
-            self.publish_velocity(0.0, 0.0)
+
+        if self.is_goal_reached():
+            if not self.goal_reached:
+                self.get_logger().info(f'Goal reached: ({self.goal_x:.2f}, {self.goal_y:.2f})')
+                self.goal_reached = True
+            self.publish_cmd(0.0, 0.0)
             return
-        
-        # Distance to current local goal (for logging)
-        dist_to_goal = np.linalg.norm(self.local_goal - self.pose[:2])
-        
-        # Detect if stuck (not moving much)
-        self.detect_stuck()
-        
-        # If in recovery mode, execute recovery behavior
-        if self.recovery_mode:
-            self.get_logger().warn('Executing recovery behavior...', throttle_duration_sec=1.0)
-            best_v, best_w = self.recovery_behavior()
-            self.publish_velocity(best_v, best_w)
-            return
-        
-        # Emergency stop if obstacle too close
-        min_scan_dist = np.min(self.scan)
-        if min_scan_dist < self.config.min_obstacle_dist:
-            self.get_logger().warn(
-                f'Emergency stop! Obstacle at {min_scan_dist:.2f}m',
-                throttle_duration_sec=1.0
-            )
-            # Try turning in place to find a way out
-            best_v, best_w = self.find_escape_maneuver()
-            self.publish_velocity(best_v, best_w)
-            return
-        
-        # Compute dynamic window based on current velocity and acceleration limits
+
+        # compute dynamic window
         dw = self.calc_dynamic_window()
-        
-        # Find best velocity command using DWA
-        best_v, best_w = self.dwa_planning(dw)
-        
-        # Check if forward is blocked for logging
-        forward_blocked = self.is_forward_blocked()
-        min_front_dist = np.min(self.scan[len(self.scan)//3:2*len(self.scan)//3]) if len(self.scan) > 0 else 999
-        
-        # Log the command periodically for debugging
-        self.get_logger().info(
-            f'Cmd: v={best_v:.2f}, w={best_w:.2f}, dist={dist_to_goal:.2f}m, front_blocked={forward_blocked}, front_dist={min_front_dist:.2f}m',
-            throttle_duration_sec=1.0
-        )
-        
-        # Publish the optimal velocity command
-        self.publish_velocity(best_v, best_w)
-    
-    def get_local_goal_from_path(self):
-        """Extract local goal from global path using lookahead distance.
-        
-        Returns:
-            numpy array [x, y] of local goal position
-        """
-        if self.global_path is None or len(self.global_path.poses) == 0:
-            return self.final_goal
-        
-        # Find the point on the path that is lookahead_dist away
-        min_dist_to_path = float('inf')
-        closest_idx = 0
-        
-        # First, find closest point on path
-        for i, pose_stamped in enumerate(self.global_path.poses):
-            px = pose_stamped.pose.position.x
-            py = pose_stamped.pose.position.y
-            dist = math.hypot(px - self.pose[0], py - self.pose[1])
-            
-            if dist < min_dist_to_path:
-                min_dist_to_path = dist
-                closest_idx = i
-        
-        # Look ahead from closest point
-        for i in range(closest_idx, len(self.global_path.poses)):
-            px = self.global_path.poses[i].pose.position.x
-            py = self.global_path.poses[i].pose.position.y
-            dist = math.hypot(px - self.pose[0], py - self.pose[1])
-            
-            if dist >= self.lookahead_dist:
-                return np.array([px, py])
-        
-        # If no point is far enough, use the last point
-        last_pose = self.global_path.poses[-1]
-        return np.array([
-            last_pose.pose.position.x,
-            last_pose.pose.position.y
-        ])
-    
-    def detect_stuck(self):
-        """Detect if robot is stuck (not making progress)."""
-        current_pos = self.pose[:2]
-        
-        # Add current position to history
-        self.position_history.append(current_pos.copy())
-        
-        # Keep only recent history (last 2 seconds = 20 samples at 10Hz)
-        if len(self.position_history) > 20:
-            self.position_history.pop(0)
-        
-        # Check if we have enough history
-        if len(self.position_history) < 20:
+
+        # search best trajectory
+        best_u, all_trajs = self.search_best_trajectory(dw)
+
+        # visualize sampled trajectories and chosen trajectory
+        self.publish_trajectories_marker(all_trajs, best_u)
+
+        if best_u is None:
+            # no valid trajectory -> stop (could add recovery later)
+            self.get_logger().warn('No valid trajectory found; stopping.')
+            self.publish_cmd(0.0, 0.0)
             return
-        
-        # Calculate distance traveled in last 2 seconds
-        start_pos = self.position_history[0]
-        end_pos = self.position_history[-1]
-        distance_traveled = np.linalg.norm(end_pos - start_pos)
-        
-        # If moved less than 10cm in 2 seconds, consider stuck
-        if distance_traveled < 0.1:
-            self.stuck_counter += 1
-            
-            if self.stuck_counter >= self.stuck_threshold:
-                self.recovery_mode = True
-                self.stuck_counter = 0
-                self.get_logger().warn(
-                    f'STUCK DETECTED! Moved only {distance_traveled:.3f}m in 2s. Starting recovery...',
-                    throttle_duration_sec=5.0
-                )
-        else:
-            # Making progress, reset counter
-            self.stuck_counter = 0
-            if self.recovery_mode:
-                # Check if we've moved enough to exit recovery
-                if distance_traveled > 0.3:
-                    self.recovery_mode = False
-                    self.get_logger().info('Recovery successful! Resuming normal operation.')
-    
-    def recovery_behavior(self):
-        """Execute recovery behavior when stuck.
-        
-        Strategy:
-        1. Back up slowly while rotating
-        2. Find direction with most clearance
-        3. Move toward clearance
-        
-        Returns:
-            Tuple of (v, w) for recovery maneuver
-        """
-        # Find direction with maximum clearance
-        best_angle_idx = np.argmax(self.scan)
-        best_clearance = self.scan[best_angle_idx]
-        
-        # Convert scan index to angle
-        best_angle = self.scan_angle_min + best_angle_idx * self.scan_angle_increment
-        
-        # Check rear clearance
-        rear_idx = int((math.pi - self.scan_angle_min) / self.scan_angle_increment)
-        if rear_idx >= len(self.scan):
-            rear_idx = len(self.scan) - 1
-        rear_clearance = self.scan[rear_idx] if rear_idx >= 0 else 0.5
-        
-        # Strategy based on clearance
-        if rear_clearance > 0.5:
-            # Safe to back up
-            v = -0.1  # Slow reverse
-            # Rotate toward best clearance while backing
-            w = np.clip(best_angle * 0.5, -1.0, 1.0)
-            self.get_logger().info(
-                f'Recovery: Backing up (rear clear: {rear_clearance:.2f}m)',
-                throttle_duration_sec=2.0
-            )
-        elif best_clearance > 0.6:
-            # Rotate in place toward best clearance
-            v = 0.0
-            w = np.clip(best_angle * 2.0, -self.config.max_yaw_rate, self.config.max_yaw_rate)
-            self.get_logger().info(
-                f'Recovery: Rotating toward clearance (angle: {best_angle:.2f}rad)',
-                throttle_duration_sec=2.0
-            )
-        else:
-            # Very limited clearance, just rotate slowly
-            v = 0.0
-            w = 0.5 if best_angle > 0 else -0.5
-            self.get_logger().warn(
-                'Recovery: Limited clearance, rotating slowly',
-                throttle_duration_sec=2.0
-            )
-        
-        return v, w
-    
-    def publish_velocity(self, v, w):
-        """Publish velocity command to cmd_vel topic."""
-        twist = Twist()
-        twist.linear.x = float(v)
-        twist.angular.z = float(w)
-        self.cmd_pub.publish(twist)
-    
-    def is_forward_blocked(self, check_angle=math.pi/6, check_dist=0.01):
-        """Check if the forward path is blocked by obstacles.
-        
-        Args:
-            check_angle: Angular range to check (radians, centered on front)
-            check_dist: Distance threshold (meters)
-            
-        Returns:
-            True if forward path is blocked, False otherwise
-        """
-        # Check laser scan readings in front of robot
-        # Front is at angle 0 in robot frame
-        center_idx = int((0 - self.scan_angle_min) / self.scan_angle_increment)
-        angle_indices = int(check_angle / self.scan_angle_increment)
-        
-        start_idx = max(0, center_idx - angle_indices)
-        end_idx = min(len(self.scan), center_idx + angle_indices)
-        
-        if start_idx < len(self.scan) and end_idx > 0:
-            front_ranges = self.scan[start_idx:end_idx]
-            min_front_dist = np.min(front_ranges)
-            return min_front_dist < check_dist
-        
-        return False
-    
-    def find_escape_maneuver(self):
-        """Find best rotation to escape from very close obstacle.
-        
-        Returns:
-            Tuple of (v, w) for escape maneuver
-        """
-        # Find the direction with maximum clearance
-        best_angle_idx = np.argmax(self.scan)
-        best_clearance = self.scan[best_angle_idx]
-        
-        # Convert scan index to angle
-        best_angle = self.scan_angle_min + best_angle_idx * self.scan_angle_increment
-        
-        # Goal angle in robot frame (use local goal if available)
-        goal_to_use = self.local_goal if self.local_goal is not None else self.final_goal
-        goal_angle = math.atan2(
-            goal_to_use[1] - self.pose[1],
-            goal_to_use[0] - self.pose[0]
-        ) - self.pose[2]
-        goal_angle = angle_normalize(goal_angle)
-        
-        # Choose between clearance direction and goal direction
-        if best_clearance > 0.5:
-            # If there's good clearance somewhere, turn toward it
-            target_angle = best_angle
-        else:
-            # Otherwise try to turn toward goal
-            target_angle = goal_angle
-        
-        # Slow forward motion + rotation toward best direction
-        v = 0.05 if abs(target_angle) < math.pi / 2 else 0.0
-        w = np.clip(2.0 * target_angle, -self.config.max_yaw_rate, self.config.max_yaw_rate)
-        
-        return v, w
 
-    def dwa_planning(self, dw):
-        """Core DWA algorithm - finds optimal velocity command.
-        
-        Args:
-            dw: Dynamic window [v_min, v_max, w_min, w_max]
-            
-        Returns:
-            Tuple of (best_v, best_w) - optimal velocity command
-        """
-        best_v, best_w = 0.0, 0.0
-        best_score = -float('inf')
-        collision_count = 0
-        total_count = 0
-        
-        # Sample velocities within dynamic window
-        v_min, v_max, w_min, w_max = dw
-        v_samples = np.arange(v_min, v_max + 1e-6, self.config.v_res)
-        w_samples = np.arange(w_min, w_max + 1e-6, self.config.yaw_res)
-        
-        # Evaluate each velocity combination
-        for v in v_samples:
-            for w in w_samples:
-                total_count += 1
-                
-                # Predict trajectory for this velocity
-                trajectory = self.predict_trajectory(v, w)
-                
-                # Check for collisions
-                if self.is_collision(trajectory):
-                    collision_count += 1
-                    continue
-                
-                # Compute costs
-                heading_cost = self.calc_heading_cost(trajectory)
-                clearance_cost = self.calc_clearance_cost(trajectory)
-                velocity_cost = self.calc_velocity_cost(v)
-                
-                # Check if forward path is blocked
-                forward_blocked = self.is_forward_blocked()
-                
-                # If forward is blocked, strongly favor rotation
-                if forward_blocked:
-                    # Penalize forward motion, strongly reward rotation
-                    rotation_bonus = abs(w) / self.config.max_yaw_rate
-                    forward_penalty = max(0, v) / self.config.max_speed
-                    
-                    total_score = (
-                        self.config.heading_weight * heading_cost +
-                        self.config.clearance_weight * clearance_cost +
-                        self.config.rotation_weight * 2.0 * rotation_bonus -  # Double rotation reward
-                        1.5 * forward_penalty  # Stronger forward penalty
-                    )
-                else:
-                    # Normal operation: prefer forward motion
-                    total_score = (
-                        self.config.heading_weight * heading_cost +
-                        self.config.clearance_weight * clearance_cost +
-                        self.config.velocity_weight * velocity_cost
-                    )
-                
-                # Update best trajectory
-                if total_score > best_score:
-                    best_score = total_score
-                    best_v = v
-                    best_w = w
-        
-        # Debug logging
-        if best_score == -float('inf'):
-            self.get_logger().warn(
-                f'No valid trajectory! All {total_count} samples collided. DW: v=[{v_min:.2f}, {v_max:.2f}], w=[{w_min:.2f}, {w_max:.2f}]',
-                throttle_duration_sec=2.0
-            )
-        
-        return best_v, best_w
-    
+        v, omega = best_u
+        self.publish_cmd(v, omega)
+
+    def is_goal_reached(self):
+        dx = self.goal_x - self.state.x
+        dy = self.goal_y - self.state.y
+        return math.hypot(dx, dy) <= self.goal_tolerance
+
+    # ---------- DWA supporting functions ----------
     def calc_dynamic_window(self):
-        """Calculate dynamic window of feasible velocities.
-        
-        The dynamic window considers:
-        1. Robot's kinematic limits (max speed, max yaw rate)
-        2. Current velocity and acceleration constraints
-        
-        Returns:
-            List [v_min, v_max, w_min, w_max]
-        """
-        v_current, w_current = self.vel
-        
-        # Velocity limits based on acceleration constraints
-        v_min = max(self.config.min_speed, v_current - self.config.max_accel * self.config.dt)
-        v_max = min(self.config.max_speed, v_current + self.config.max_accel * self.config.dt)
-        w_min = max(-self.config.max_yaw_rate, w_current - self.config.max_delta_yaw_rate * self.config.dt)
-        w_max = min(self.config.max_yaw_rate, w_current + self.config.max_delta_yaw_rate * self.config.dt)
-        
-        return [v_min, v_max, w_min, w_max]
+        # base limits
+        min_v = self.min_vel_x
+        max_v = self.max_vel_x
+        min_omega = -self.max_yaw_rate
+        max_omega = self.max_yaw_rate
 
-    def predict_trajectory(self, v, w):
-        """Predict robot trajectory for given velocities.
-        
-        Uses simple Euler integration for differential drive kinematics.
-        
-        Args:
-            v: Linear velocity (m/s)
-            w: Angular velocity (rad/s)
-            
-        Returns:
-            numpy array of shape (n_steps, 3) containing [x, y, yaw] at each step
-        """
-        trajectory = []
-        x, y, yaw = self.pose
+        # dynamic limits based on current speed & accelerations over dt (control timestep)
+        max_v_dyn = self.state.v + self.max_acc_x * self.dt
+        min_v_dyn = self.state.v - self.max_acc_x * self.dt
+        max_omega_dyn = self.state.omega + self.max_acc_yaw * self.dt
+        min_omega_dyn = self.state.omega - self.max_acc_yaw * self.dt
+
+        dw_min_v = max(min_v, min_v_dyn)
+        dw_max_v = min(max_v, max_v_dyn)
+        dw_min_omega = max(min_omega, min_omega_dyn)
+        dw_max_omega = min(max_omega, max_omega_dyn)
+
+        # guard
+        if dw_min_v > dw_max_v:
+            dw_min_v, dw_max_v = min_v, max_v
+        if dw_min_omega > dw_max_omega:
+            dw_min_omega, dw_max_omega = -self.max_yaw_rate, self.max_yaw_rate
+
+        return (dw_min_v, dw_max_v, dw_min_omega, dw_max_omega)
+
+    def generate_trajectory(self, v, omega):
+        # forward-simulate simple unicycle for predict_time using fixed (v,omega)
+        x = self.state.x
+        y = self.state.y
+        yaw = self.state.yaw
+        traj = []
         t = 0.0
-        
-        while t <= self.config.predict_time:
-            # Differential drive kinematics (Euler integration)
-            x += v * math.cos(yaw) * self.config.dt
-            y += v * math.sin(yaw) * self.config.dt
-            yaw += w * self.config.dt
-            yaw = angle_normalize(yaw)  # Keep yaw in [-pi, pi]
-            
-            trajectory.append([x, y, yaw])
-            t += self.config.dt
-        
-        return np.array(trajectory)
-    
-    def is_collision(self, trajectory):
-        """Check if trajectory collides with obstacles.
-        
-        For each point in the trajectory, checks multiple points around the robot's
-        footprint against laser scan data.
-        
-        Args:
-            trajectory: Array of shape (n_steps, 3) containing [x, y, yaw]
-            
-        Returns:
-            True if collision detected, False otherwise
-        """
-        robot_radius = self.config.robot_radius + self.config.safety_margin
-        
-        # Sample fewer points for performance (every 3rd step)
-        step = max(1, len(trajectory) // 5)
-        
-        # Check multiple points along the trajectory
-        for i in range(0, len(trajectory), step):
-            pose = trajectory[i]
-            
-            # Check center and front of robot
-            check_points = [
-                pose[:2],  # Center
-                pose[:2] + robot_radius * np.array([math.cos(pose[2]), math.sin(pose[2])]),  # Front
-            ]
-            
-            for point in check_points:
-                # Transform point to robot's current frame
-                dx = point[0] - self.pose[0]
-                dy = point[1] - self.pose[1]
-                
-                # Distance and angle from robot to this point
-                dist = math.hypot(dx, dy)
-                
-                # Skip if checking the robot's current position
-                if dist < 0.01:
-                    continue
-                    
-                angle = math.atan2(dy, dx) - self.pose[2]  # Relative to robot's heading
-                angle = angle_normalize(angle)
-                
-                # Find corresponding laser scan index
-                scan_idx = int((angle - self.scan_angle_min) / self.scan_angle_increment)
-                
-                # Only check if within scan range
-                if 0 <= scan_idx < len(self.scan):
-                    # Check if obstacle is closer than predicted position
-                    if self.scan[scan_idx] < dist:
-                        return True
-        
-        return False
-    
-    def calc_heading_cost(self, trajectory):
-        """Calculate cost based on heading toward goal.
-        
-        Rewards trajectories that end closer to goal and point toward it.
-        Also considers current position for better immediate goal alignment.
-        
-        Args:
-            trajectory: Array of shape (n_steps, 3) containing [x, y, yaw]
-            
-        Returns:
-            Normalized cost value (higher is better)
-        """
-        # Get final position from trajectory
-        final_pos = trajectory[-1, :2]
-        final_yaw = trajectory[-1, 2]
-        
-        # Use local goal for heading calculation
-        goal_to_use = self.local_goal if self.local_goal is not None else self.final_goal
-        
-        # Distance from final position to goal
-        to_goal = goal_to_use - final_pos
-        dist_to_goal = np.linalg.norm(to_goal)
-        
-        # Angle to goal from final position
-        angle_to_goal = math.atan2(to_goal[1], to_goal[0])
-        heading_error = abs(angle_normalize(angle_to_goal - final_yaw))
-        
-        # Also check progress from current position
-        current_dist_to_goal = np.linalg.norm(goal_to_use - self.pose[:2])
-        progress = max(0, current_dist_to_goal - dist_to_goal)
-        
-        # Cost components with aggressive weighting
-        dist_cost = 1.0 - min(dist_to_goal / 10.0, 1.0)  # Closer is better
-        
-        # Exponentially reward good heading alignment (strongly penalize misalignment)
-        heading_cost = math.exp(-3.0 * heading_error)     # Exponential: small error = high reward
-        
-        progress_cost = min(progress * 3.0, 1.0)          # Strongly reward progress
-        
-        # Weight heading alignment most heavily
-        return dist_cost + 2.0 * heading_cost + progress_cost
-    
-    def calc_clearance_cost(self, trajectory):
-        """Calculate cost based on clearance from obstacles.
-        
-        Rewards trajectories that maintain distance from obstacles.
-        Uses an exponential cost to strongly penalize close approaches.
-        
-        Args:
-            trajectory: Array of shape (n_steps, 3) containing [x, y, yaw]
-            
-        Returns:
-            Normalized cost value (higher is better)
-        """
-        min_clearance = float('inf')
-        
-        # Sample points along trajectory to check clearance
-        step = max(1, len(trajectory) // 10)
-        
-        for i in range(0, len(trajectory), step):
-            pose = trajectory[i]
-            
-            # Check multiple angles around the robot at this pose
-            for angle_offset in [-math.pi/4, 0, math.pi/4]:  # Check left, front, right
-                check_angle = pose[2] + angle_offset
-                
-                # Point to check
-                check_x = pose[0] + self.config.robot_radius * math.cos(check_angle)
-                check_y = pose[1] + self.config.robot_radius * math.sin(check_angle)
-                
-                # Transform to robot's current frame
-                dx = check_x - self.pose[0]
-                dy = check_y - self.pose[1]
-                
-                dist = math.hypot(dx, dy)
-                if dist < 0.01:
-                    continue
-                    
-                angle = math.atan2(dy, dx) - self.pose[2]
-                angle = angle_normalize(angle)
-                
-                # Find laser scan reading
-                scan_idx = int((angle - self.scan_angle_min) / self.scan_angle_increment)
-                
-                if 0 <= scan_idx < len(self.scan):
-                    # Clearance is obstacle distance minus trajectory distance
-                    clearance = self.scan[scan_idx] - dist
-                    min_clearance = min(min_clearance, clearance)
-        
-        # If no valid clearance found, return high clearance (no obstacles seen)
-        if min_clearance == float('inf'):
-            return 1.0
-        
-        # Exponential cost: strongly rewards larger clearance near obstacles
-        # 0.3m clearance = 0.5 cost, 0.6m+ = 1.0 cost
-        if min_clearance < 0:
-            return 0.0  # Collision
-        else:
-            # Exponential reward for clearance
-            return min(1.0, 1.0 - math.exp(-2.0 * min_clearance))
-    
-    def calc_velocity_cost(self, v):
-        """Calculate cost based on velocity.
-        
-        Rewards faster forward motion.
-        
-        Args:
-            v: Linear velocity (m/s)
-            
-        Returns:
-            Normalized cost value (higher is better)
-        """
-        # Normalize by max speed
-        return v / self.config.max_speed
+        while t <= self.predict_time:
+            x += v * math.cos(yaw) * self.dt
+            y += v * math.sin(yaw) * self.dt
+            yaw += omega * self.dt
+            traj.append((x, y, yaw))
+            t += self.dt
+        return traj
 
+    def calc_obstacle_cost(self, traj):
+        """
+        Return an obstacle cost (lower is better). If any pose collides (within inflated radius),
+        return None to mark trajectory invalid.
+        """
+        if not self.scan_pts_world:
+            # no scan data: be conservative but treat it valid with small penalty
+            return 1.0
+
+        inflation = self.robot_radius + self.obstacle_inflation
+        inflation_sq = inflation * inflation
+        min_dist_sq = float('inf')
+
+        # For each pose in trajectory, check distance to each scan point (in world coords)
+        for (x_t, y_t, _) in traj:
+            for (px_w, py_w, _) in self.scan_pts_world:
+                dx = px_w - x_t
+                dy = py_w - y_t
+                d2 = dx * dx + dy * dy
+                if d2 < inflation_sq:
+                    return None  # collision
+                if d2 < min_dist_sq:
+                    min_dist_sq = d2
+
+        if min_dist_sq == float('inf'):
+            return 0.0
+        min_dist = math.sqrt(min_dist_sq)
+        # obstacle cost as inverse of clearance (bigger clearance -> smaller cost)
+        return 1.0 / (max(min_dist - self.obstacle_inflation, 1e-6))
+
+    def calc_to_goal_cost(self, traj):
+        # distance from last pose to goal
+        if not traj:
+            return float('inf')
+        last = traj[-1]
+        dx = self.goal_x - last[0]
+        dy = self.goal_y - last[1]
+        return math.hypot(dx, dy)
+
+    def search_best_trajectory(self, dw):
+        (v_min, v_max, om_min, om_max) = dw
+
+        # sampling counts
+        v_steps = max(1, int(math.ceil((v_max - v_min) / self.v_resolution)))
+        om_steps = max(1, int(math.ceil((om_max - om_min) / self.omega_resolution)))
+
+        best_score = -float('inf')
+        best_u = None
+        all_trajs = []  # list of tuples (v, omega, traj, valid, cost)
+
+        for i in range(v_steps + 1):
+            v = v_min + i * (v_max - v_min) / max(1, v_steps)
+            for j in range(om_steps + 1):
+                omega = om_min + j * (om_max - om_min) / max(1, om_steps)
+                traj = self.generate_trajectory(v, omega)
+
+                # obstacle check
+                ob_cost = self.calc_obstacle_cost(traj)
+                if ob_cost is None:
+                    all_trajs.append((v, omega, traj, False, float('inf')))
+                    continue
+
+                to_goal = self.calc_to_goal_cost(traj)
+                speed_score = v  # prefer higher speed
+                # combine into score (higher better)
+                score = (self.to_goal_cost_gain * (1.0 / (1.0 + to_goal))
+                         + self.speed_cost_gain * speed_score
+                         - self.obstacle_cost_gain * ob_cost)
+
+                all_trajs.append((v, omega, traj, True, score))
+
+                if score > best_score:
+                    best_score = score
+                    best_u = (v, omega)
+
+        return best_u, all_trajs
+
+    # ---------- visualization ----------
+    def publish_trajectories_marker(self, all_trajs, best_u):
+        # Publish all sampled trajectories as faint lines (frame: odom)
+        # and best trajectory as brighter line.
+        # All markers use frame_id 'odom' so they line up with odometry.
+        header_frame = 'odom'
+
+        # All-samples marker (LINE_LIST): each small segment is added consecutively
+        all_marker = Marker()
+        all_marker.header.frame_id = header_frame
+        all_marker.header.stamp = self.get_clock().now().to_msg()
+        all_marker.ns = 'dwa_all'
+        all_marker.id = 0
+        all_marker.type = Marker.LINE_LIST
+        all_marker.action = Marker.ADD
+        all_marker.scale.x = 0.02  # line width
+        all_marker.color.r = 0.6
+        all_marker.color.g = 0.6
+        all_marker.color.b = 0.6
+        all_marker.color.a = 0.35
+
+        # Best trajectory marker (LINE_STRIP)
+        best_marker = Marker()
+        best_marker.header.frame_id = header_frame
+        best_marker.header.stamp = self.get_clock().now().to_msg()
+        best_marker.ns = 'dwa_best'
+        best_marker.id = 1
+        best_marker.type = Marker.LINE_STRIP
+        best_marker.action = Marker.ADD
+        best_marker.scale.x = 0.05
+        best_marker.color.r = 0.0
+        best_marker.color.g = 1.0
+        best_marker.color.b = 0.0
+        best_marker.color.a = 0.9
+
+        # optional: endpoint of best trajectory (sphere)
+        endpoint_marker = Marker()
+        endpoint_marker.header.frame_id = header_frame
+        endpoint_marker.header.stamp = self.get_clock().now().to_msg()
+        endpoint_marker.ns = 'dwa_endpoint'
+        endpoint_marker.id = 2
+        endpoint_marker.type = Marker.SPHERE
+        endpoint_marker.action = Marker.ADD
+        endpoint_marker.scale.x = 0.08
+        endpoint_marker.scale.y = 0.08
+        endpoint_marker.scale.z = 0.08
+        endpoint_marker.color.r = 1.0
+        endpoint_marker.color.g = 0.4
+        endpoint_marker.color.b = 0.0
+        endpoint_marker.color.a = 0.9
+
+        # Build markers
+        best_traj_points = None
+        for (v, omega, traj, valid, score) in all_trajs:
+            # Draw each trajectory as many small segments in LINE_LIST
+            if len(traj) < 2:
+                continue
+            # choose color brightness based on validity (we use alpha only through marker)
+            for k in range(len(traj) - 1):
+                p1 = traj[k]
+                p2 = traj[k + 1]
+                pt1 = Point(x=p1[0], y=p1[1], z=0.02)
+                pt2 = Point(x=p2[0], y=p2[1], z=0.02)
+                all_marker.points.append(pt1)
+                all_marker.points.append(pt2)
+
+            # if this is best trajectory, store for drawing a LINE_STRIP
+            if best_u is not None and math.isclose(v, best_u[0], rel_tol=1e-6) and math.isclose(omega, best_u[1], rel_tol=1e-6):
+                best_traj_points = traj
+
+        # Fill best_marker if found
+        if best_traj_points is not None:
+            for p in best_traj_points:
+                best_marker.points.append(Point(x=p[0], y=p[1], z=0.03))
+            # endpoint
+            end = best_traj_points[-1]
+            endpoint_marker.pose.position = Point(x=end[0], y=end[1], z=0.03)
+        else:
+            # empty markers (no valid best) - give a tiny empty point to avoid RViz warnings
+            all_marker.points = all_marker.points[:2000]  # safety trim
+
+        # publish
+        self.traj_pub.publish(all_marker)
+        self.best_pub.publish(best_marker)
+        # endpoint as separate marker (helps identify where it's heading)
+        self.best_pub.publish(endpoint_marker)
+
+    # ---------- I/O ----------
+    def publish_cmd(self, v, omega):
+        t = Twist()
+        t.linear.x = float(v)
+        t.angular.z = float(omega)
+        self.cmd_pub.publish(t)
+
+
+# ---------- main ----------
 def main(args=None):
     rclpy.init(args=args)
-    node = DWALocalPlanner()
+    node = SimpleDWA()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
-    node.destroy_node()
-    rclpy.shutdown()
+        node.get_logger().info('Shutting down DWA node')
+    finally:
+        # stop robot before exit
+        node.publish_cmd(0.0, 0.0)
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
