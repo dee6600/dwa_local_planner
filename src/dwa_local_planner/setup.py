@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'dwa_node = dwa_local_planner.dwa_node:main',
+            'global_planner = dwa_local_planner.simple_global_planner:main',
         ],
     },
 )

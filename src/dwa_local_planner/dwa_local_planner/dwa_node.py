@@ -10,8 +10,8 @@ It computes collision-free velocity commands by:
 """
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist, PoseStamped
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
 import numpy as np
 import math
@@ -96,8 +96,11 @@ class DWALocalPlanner(Node):
         # Load configuration
         self.config = DWAConfig()
         
-        # Goal position (hardcoded for demo - replace with goal subscriber in production)
-        self.goal = np.array([2.0, 0.0])
+        # Goal and path following
+        self.final_goal = np.array([2.0, 0.0])  # Final goal position
+        self.global_path = None       # Global path from planner
+        self.local_goal = None        # Current local waypoint to follow
+        self.lookahead_dist = 1.0     # Distance to look ahead on path
         
         # Robot state
         self.pose = None              # Current pose [x, y, yaw]
@@ -109,13 +112,18 @@ class DWALocalPlanner(Node):
         # ROS 2 interfaces
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
+        self.create_subscription(Path, '/plan', self.path_cb, 10)
+        self.create_subscription(PoseStamped, '/goal_pose', self.goal_cb, 10)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.goal_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
         
         # Control loop timer
         self.create_timer(self.config.dt, self.control_loop)
         
         self.get_logger().info('DWA Local Planner initialized')
-        self.get_logger().info(f'Goal: [{self.goal[0]:.2f}, {self.goal[1]:.2f}]')
+        self.get_logger().info(f'Final goal: [{self.final_goal[0]:.2f}, {self.final_goal[1]:.2f}]')
+        self.get_logger().info('Waiting for global path on /plan topic...')
+        self.get_logger().info('Or send goal to /goal_pose to trigger planning')
 
     def odom_cb(self, msg):
         """Odometry callback - updates robot pose and velocity."""
@@ -146,6 +154,23 @@ class DWALocalPlanner(Node):
         self.scan_angle_min = msg.angle_min
         self.scan_angle_increment = msg.angle_increment
         self.scan_range_max = msg.range_max
+    
+    def path_cb(self, msg):
+        """Path callback - receives global path from planner."""
+        if len(msg.poses) > 0:
+            self.global_path = msg
+            self.get_logger().info(
+                f'Received global path with {len(msg.poses)} waypoints',
+                once=True
+            )
+    
+    def goal_cb(self, msg):
+        """Goal callback - receives new goal pose."""
+        self.final_goal = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y
+        ])
+        self.get_logger().info(f'New goal received: [{self.final_goal[0]:.2f}, {self.final_goal[1]:.2f}]')
 
     def control_loop(self):
         """Main control loop - runs at configured rate (default 10 Hz)."""
@@ -154,12 +179,26 @@ class DWALocalPlanner(Node):
             self.get_logger().warn('Waiting for sensor data...', throttle_duration_sec=2.0)
             return
         
-        # Check if we've reached the goal
-        dist_to_goal = np.linalg.norm(self.goal - self.pose[:2])
-        if dist_to_goal < 0.2:  # Goal tolerance
-            self.get_logger().info('Goal reached!', once=True)
+        # Update local goal from path or use final goal
+        if self.global_path is not None:
+            self.local_goal = self.get_local_goal_from_path()
+        else:
+            # No path available, head directly to final goal
+            self.local_goal = self.final_goal
+            self.get_logger().warn(
+                'No global path available, heading directly to goal',
+                throttle_duration_sec=5.0
+            )
+        
+        # Check if we've reached the final goal
+        dist_to_final_goal = np.linalg.norm(self.final_goal - self.pose[:2])
+        if dist_to_final_goal < 0.2:  # Goal tolerance
+            self.get_logger().info('Final goal reached!', once=True)
             self.publish_velocity(0.0, 0.0)
             return
+        
+        # Distance to current local goal (for logging)
+        dist_to_goal = np.linalg.norm(self.local_goal - self.pose[:2])
         
         # Emergency stop only if obstacle is VERY close
         min_scan_dist = np.min(self.scan)
@@ -191,6 +230,45 @@ class DWALocalPlanner(Node):
         
         # Publish the optimal velocity command
         self.publish_velocity(best_v, best_w)
+    
+    def get_local_goal_from_path(self):
+        """Extract local goal from global path using lookahead distance.
+        
+        Returns:
+            numpy array [x, y] of local goal position
+        """
+        if self.global_path is None or len(self.global_path.poses) == 0:
+            return self.final_goal
+        
+        # Find the point on the path that is lookahead_dist away
+        min_dist_to_path = float('inf')
+        closest_idx = 0
+        
+        # First, find closest point on path
+        for i, pose_stamped in enumerate(self.global_path.poses):
+            px = pose_stamped.pose.position.x
+            py = pose_stamped.pose.position.y
+            dist = math.hypot(px - self.pose[0], py - self.pose[1])
+            
+            if dist < min_dist_to_path:
+                min_dist_to_path = dist
+                closest_idx = i
+        
+        # Look ahead from closest point
+        for i in range(closest_idx, len(self.global_path.poses)):
+            px = self.global_path.poses[i].pose.position.x
+            py = self.global_path.poses[i].pose.position.y
+            dist = math.hypot(px - self.pose[0], py - self.pose[1])
+            
+            if dist >= self.lookahead_dist:
+                return np.array([px, py])
+        
+        # If no point is far enough, use the last point
+        last_pose = self.global_path.poses[-1]
+        return np.array([
+            last_pose.pose.position.x,
+            last_pose.pose.position.y
+        ])
     
     def publish_velocity(self, v, w):
         """Publish velocity command to cmd_vel topic."""
@@ -237,10 +315,11 @@ class DWALocalPlanner(Node):
         # Convert scan index to angle
         best_angle = self.scan_angle_min + best_angle_idx * self.scan_angle_increment
         
-        # Goal angle in robot frame
+        # Goal angle in robot frame (use local goal if available)
+        goal_to_use = self.local_goal if self.local_goal is not None else self.final_goal
         goal_angle = math.atan2(
-            self.goal[1] - self.pose[1],
-            self.goal[0] - self.pose[0]
+            goal_to_use[1] - self.pose[1],
+            goal_to_use[0] - self.pose[0]
         ) - self.pose[2]
         goal_angle = angle_normalize(goal_angle)
         
@@ -450,8 +529,11 @@ class DWALocalPlanner(Node):
         final_pos = trajectory[-1, :2]
         final_yaw = trajectory[-1, 2]
         
+        # Use local goal for heading calculation
+        goal_to_use = self.local_goal if self.local_goal is not None else self.final_goal
+        
         # Distance from final position to goal
-        to_goal = self.goal - final_pos
+        to_goal = goal_to_use - final_pos
         dist_to_goal = np.linalg.norm(to_goal)
         
         # Angle to goal from final position
@@ -459,7 +541,7 @@ class DWALocalPlanner(Node):
         heading_error = abs(angle_normalize(angle_to_goal - final_yaw))
         
         # Also check progress from current position
-        current_dist_to_goal = np.linalg.norm(self.goal - self.pose[:2])
+        current_dist_to_goal = np.linalg.norm(goal_to_use - self.pose[:2])
         progress = max(0, current_dist_to_goal - dist_to_goal)
         
         # Cost components

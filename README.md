@@ -28,21 +28,54 @@ colcon build --packages-select dwa_local_planner
 
 ## Usage
 
-1. Source the overlay:
-   ```bash
-   source install/setup.bash
-   ```
+### Option 1: DWA with Global Planner (Recommended)
 
-2. Launch TurtleBot3 in Gazebo (in a separate terminal):
+1. **Terminal 1** - Launch Gazebo:
    ```bash
    export TURTLEBOT3_MODEL=waffle_pi
    ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
    ```
 
-3. Run the DWA planner node:
+2. **Terminal 2** - Source and run global planner:
    ```bash
+   cd ~/ros2_ws
+   source install/setup.bash
+   ros2 run dwa_local_planner global_planner
+   ```
+
+3. **Terminal 3** - Source and run DWA local planner:
+   ```bash
+   cd ~/ros2_ws
+   source install/setup.bash
    ros2 run dwa_local_planner dwa_node
    ```
+
+4. **Terminal 4** - Send a goal:
+   ```bash
+   cd ~/ros2_ws
+   source install/setup.bash
+   ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped "{
+     header: {frame_id: 'odom'},
+     pose: {position: {x: 2.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}
+   }"
+   ```
+
+### Option 2: DWA Only (Direct to Goal)
+
+1. **Terminal 1** - Launch Gazebo:
+   ```bash
+   export TURTLEBOT3_MODEL=waffle_pi
+   ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
+   ```
+
+2. **Terminal 2** - Source and run DWA planner:
+   ```bash
+   cd ~/ros2_ws
+   source install/setup.bash
+   ros2 run dwa_local_planner dwa_node
+   ```
+   
+   Note: Without a global planner, the robot will attempt to go straight to the hardcoded goal.
 
 ## Testing
 

@@ -49,16 +49,60 @@ Integration points
 - Publishes to `/cmd_vel` (Twist) and subscribes to `/odom` (Odometry) and `/scan` (LaserScan). Any change to topic names should be reflected in launch files or tests.
 - The code expects scans in robot frame with `angle_min`, `angle_increment` set; when integrating other sensors, ensure these fields are populated.
 
-If you change behavior
+## DWA Local Planner — Copilot Instructions
 
-- Update or add unit tests under `src/dwa_local_planner/test/` and run `colcon test`.
-- Keep messages in the same message types (Twist/Odometry/LaserScan) to avoid breaking integration tests.
+Purpose: concise, repo-specific guidance for AI coding agents to be productive quickly.
 
-Files worth referencing in edits
+- Repo layout: a ROS2 workspace with a single ament_python package at `src/dwa_local_planner`.
+- Language: Python 3 (uses `rclpy`, ROS message types, `numpy`).
 
-- `src/dwa_local_planner/dwa_local_planner/dwa_node.py` — main implementation
-- `src/dwa_local_planner/setup.py` — console script entry
-- `src/dwa_local_planner/package.xml` — ament and deps
-- `src/dwa_local_planner/test/` — test stubs and lint guards
+Quick commands (run from workspace root):
 
-If anything here is unclear or you want more examples (e.g., how to add ROS2 parameters, a launch file, or a small unit test for `predict_trajectory`), tell me which area to expand and I will update this file.
+- Build package: `colcon build --packages-select dwa_local_planner`
+- Source overlay after a successful build: `source install/setup.bash` (or `source install/local_setup.bash` for session-local)
+- Run node (once built and sourced): `ros2 run dwa_local_planner dwa_node`
+- Run tests: `colcon test --packages-select dwa_local_planner` && `colcon test-result --verbose`
+
+Big picture
+
+- This repo is a compact demo of a Dynamic Window Approach local planner implemented as a single node: `DWALocalPlanner` in `dwa_node.py`.
+- Data flow: sensor `LaserScan` (`/scan`) -> planner (`predict_trajectory`, collision check) -> outputs `Twist` on `/cmd_vel`. The node also subscribes to `/odom` for current state.
+- Design rationale: single-file demo for clarity and easy experimentation — expect hardcoded params and simple Euler integration for trajectory prediction.
+
+Where to look first
+
+- `src/dwa_local_planner/dwa_local_planner/dwa_node.py`: the entire planner lives here. Key symbols:
+  - `class DWALocalPlanner(Node)` — subscriptions/publishers/timer and main loop.
+  - `self.goal = np.array([2.0, 0.0])` — quick demo goal; change here or convert to ROS parameters.
+  - `scan_cb` — converts `msg.ranges` to numpy and replaces NaN/Inf with `msg.range_max`.
+  - `predict_trajectory` — Euler integration to forward-simulate candidate velocities.
+  - collision-check logic maps scan angles to indices using `angle_min`/`angle_increment` and treats out-of-range as collision (conservative).
+
+Developer workflows & debugging
+
+- Build: `colcon build --packages-select dwa_local_planner` (use `--symlink-install` locally for faster iteration).
+- Source overlay: `source install/setup.bash` (or `source install/local_setup.bash`).
+- Run node: `ros2 run dwa_local_planner dwa_node`.
+- Debugging tips: use `ros2 topic echo /scan` and `ros2 topic echo /odom` to inspect inputs; `ros2 topic echo /cmd_vel` to verify outputs. Use `ros2 topic pub` to publish synthetic messages for unit tests.
+- Tests & lint: tests are in `src/dwa_local_planner/test/` (ament/pytest stubs include `test_flake8.py`, `test_pep257.py`). Run `colcon test` and check `colcon test-result --verbose`.
+
+Conventions & repo-specific patterns
+
+- Keep `rclpy.Node` idioms: use `create_subscription`, `create_publisher`, `create_timer` patterns as present in `dwa_node.py`.
+- Sensor preprocessing: always normalize `msg.ranges` to a numpy array and replace NaN/Inf with `msg.range_max` (see `scan_cb`).
+- Safety-first collision model: out-of-range or missing scan indices are treated as collisions — preserve this when refactoring.
+- Dependency management: add runtime deps to `package.xml` (ROS/ament). `setup.py` only exposes the console script entrypoint.
+
+When changing behavior
+
+- Prefer adding ROS2 parameters (read in `__init__`) instead of editing hardcoded constants in-place.
+- Update or add unit tests in `src/dwa_local_planner/test/` when altering planner logic.
+
+Key files
+
+- `src/dwa_local_planner/dwa_local_planner/dwa_node.py` — main node and algorithm.
+- `src/dwa_local_planner/package.xml` — ament/ROS dependencies.
+- `src/dwa_local_planner/setup.py` — console script entry: `dwa_node = dwa_local_planner.dwa_node:main`.
+- `src/dwa_local_planner/test/` — test stubs (linting + style checks).
+
+If any section is missing details you'd like (examples: turning hardcoded values into ROS parameters, adding a launch file, or a unit test example for `predict_trajectory`), tell me which area to expand and I'll iterate.

@@ -10,6 +10,7 @@ setup.py
 ../../build/dwa_local_planner/dwa_local_planner.egg-info/zip-safe
 dwa_local_planner/__init__.py
 dwa_local_planner/dwa_node.py
+dwa_local_planner/simple_global_planner.py
 resource/dwa_local_planner
 test/test_copyright.py
 test/test_flake8.py
