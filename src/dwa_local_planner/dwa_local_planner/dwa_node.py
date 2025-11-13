@@ -102,6 +102,15 @@ class DWALocalPlanner(Node):
         self.local_goal = None        # Current local waypoint to follow
         self.lookahead_dist = 1.0     # Distance to look ahead on path
         
+        # Recovery/stuck detection
+        self.stuck_counter = 0        # Counts control loops with low velocity
+        self.stuck_threshold = 20     # Loops before considering stuck (2 seconds at 10Hz)
+        self.recovery_mode = False    # Whether in recovery mode
+        self.last_position = None     # Track position for stuck detection
+        self.position_history = []    # Recent positions for stuck detection
+        self.no_path_counter = 0      # Counts loops without valid path
+        self.no_path_threshold = 30   # Loops before recovery (3 seconds)
+        
         # Robot state
         self.pose = None              # Current pose [x, y, yaw]
         self.vel = [0.0, 0.0]         # Current velocity [v, w]
@@ -180,10 +189,23 @@ class DWALocalPlanner(Node):
             return
         
         # Update local goal from path or use final goal
-        if self.global_path is not None:
+        if self.global_path is not None and len(self.global_path.poses) > 0:
             self.local_goal = self.get_local_goal_from_path()
+            self.no_path_counter = 0  # Reset counter
         else:
-            # No path available, head directly to final goal
+            # No path available
+            self.no_path_counter += 1
+            
+            if self.no_path_counter > self.no_path_threshold:
+                # No path for too long, trigger recovery
+                self.get_logger().warn(
+                    'No global path for 3 seconds, triggering recovery',
+                    throttle_duration_sec=3.0
+                )
+                self.recovery_mode = True
+                return
+            
+            # Use final goal temporarily
             self.local_goal = self.final_goal
             self.get_logger().warn(
                 'No global path available, heading directly to goal',
@@ -200,7 +222,17 @@ class DWALocalPlanner(Node):
         # Distance to current local goal (for logging)
         dist_to_goal = np.linalg.norm(self.local_goal - self.pose[:2])
         
-        # Emergency stop only if obstacle is VERY close
+        # Detect if stuck (not moving much)
+        self.detect_stuck()
+        
+        # If in recovery mode, execute recovery behavior
+        if self.recovery_mode:
+            self.get_logger().warn('Executing recovery behavior...', throttle_duration_sec=1.0)
+            best_v, best_w = self.recovery_behavior()
+            self.publish_velocity(best_v, best_w)
+            return
+        
+        # Emergency stop if obstacle too close
         min_scan_dist = np.min(self.scan)
         if min_scan_dist < self.config.min_obstacle_dist:
             self.get_logger().warn(
@@ -269,6 +301,99 @@ class DWALocalPlanner(Node):
             last_pose.pose.position.x,
             last_pose.pose.position.y
         ])
+    
+    def detect_stuck(self):
+        """Detect if robot is stuck (not making progress)."""
+        current_pos = self.pose[:2]
+        
+        # Add current position to history
+        self.position_history.append(current_pos.copy())
+        
+        # Keep only recent history (last 2 seconds = 20 samples at 10Hz)
+        if len(self.position_history) > 20:
+            self.position_history.pop(0)
+        
+        # Check if we have enough history
+        if len(self.position_history) < 20:
+            return
+        
+        # Calculate distance traveled in last 2 seconds
+        start_pos = self.position_history[0]
+        end_pos = self.position_history[-1]
+        distance_traveled = np.linalg.norm(end_pos - start_pos)
+        
+        # If moved less than 10cm in 2 seconds, consider stuck
+        if distance_traveled < 0.1:
+            self.stuck_counter += 1
+            
+            if self.stuck_counter >= self.stuck_threshold:
+                self.recovery_mode = True
+                self.stuck_counter = 0
+                self.get_logger().warn(
+                    f'STUCK DETECTED! Moved only {distance_traveled:.3f}m in 2s. Starting recovery...',
+                    throttle_duration_sec=5.0
+                )
+        else:
+            # Making progress, reset counter
+            self.stuck_counter = 0
+            if self.recovery_mode:
+                # Check if we've moved enough to exit recovery
+                if distance_traveled > 0.3:
+                    self.recovery_mode = False
+                    self.get_logger().info('Recovery successful! Resuming normal operation.')
+    
+    def recovery_behavior(self):
+        """Execute recovery behavior when stuck.
+        
+        Strategy:
+        1. Back up slowly while rotating
+        2. Find direction with most clearance
+        3. Move toward clearance
+        
+        Returns:
+            Tuple of (v, w) for recovery maneuver
+        """
+        # Find direction with maximum clearance
+        best_angle_idx = np.argmax(self.scan)
+        best_clearance = self.scan[best_angle_idx]
+        
+        # Convert scan index to angle
+        best_angle = self.scan_angle_min + best_angle_idx * self.scan_angle_increment
+        
+        # Check rear clearance
+        rear_idx = int((math.pi - self.scan_angle_min) / self.scan_angle_increment)
+        if rear_idx >= len(self.scan):
+            rear_idx = len(self.scan) - 1
+        rear_clearance = self.scan[rear_idx] if rear_idx >= 0 else 0.5
+        
+        # Strategy based on clearance
+        if rear_clearance > 0.5:
+            # Safe to back up
+            v = -0.1  # Slow reverse
+            # Rotate toward best clearance while backing
+            w = np.clip(best_angle * 0.5, -1.0, 1.0)
+            self.get_logger().info(
+                f'Recovery: Backing up (rear clear: {rear_clearance:.2f}m)',
+                throttle_duration_sec=2.0
+            )
+        elif best_clearance > 0.6:
+            # Rotate in place toward best clearance
+            v = 0.0
+            w = np.clip(best_angle * 2.0, -self.config.max_yaw_rate, self.config.max_yaw_rate)
+            self.get_logger().info(
+                f'Recovery: Rotating toward clearance (angle: {best_angle:.2f}rad)',
+                throttle_duration_sec=2.0
+            )
+        else:
+            # Very limited clearance, just rotate slowly
+            v = 0.0
+            w = 0.5 if best_angle > 0 else -0.5
+            self.get_logger().warn(
+                'Recovery: Limited clearance, rotating slowly',
+                throttle_duration_sec=2.0
+            )
+        
+        return v, w
     
     def publish_velocity(self, v, w):
         """Publish velocity command to cmd_vel topic."""

@@ -33,6 +33,11 @@ class SimpleGlobalPlanner(Node):
         self.grid = np.zeros((self.grid_size, self.grid_size))
         self.grid_origin = [-5.0, -5.0]  # Bottom-left corner in world frame
         
+        # Robot dimensions (TurtleBot3 Waffle Pi)
+        self.robot_radius = 0.22  # meters
+        self.safety_distance = 0.35  # Additional safe distance from obstacles
+        self.inflation_radius = self.robot_radius + self.safety_distance  # Total inflation
+        
         # Subscribers
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
@@ -122,14 +127,22 @@ class SimpleGlobalPlanner(Node):
             gx, gy = self.world_to_grid(ox, oy)
             
             if 0 <= gx < self.grid_size and 0 <= gy < self.grid_size:
-                # Mark obstacle and inflate
-                for dx in range(-2, 3):
-                    for dy in range(-2, 3):
+                # Mark obstacle and inflate based on robot dimensions
+                inflation_cells = int(self.inflation_radius / self.grid_resolution)
+                
+                for dx in range(-inflation_cells, inflation_cells + 1):
+                    for dy in range(-inflation_cells, inflation_cells + 1):
                         nx, ny = gx + dx, gy + dy
                         if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size:
-                            dist = math.hypot(dx, dy)
-                            if dist < 3:
-                                self.grid[ny, nx] = min(100, self.grid[ny, nx] + 30 / (1 + dist))
+                            dist = math.hypot(dx, dy) * self.grid_resolution  # Distance in meters
+                            
+                            if dist <= self.robot_radius:
+                                # Lethal obstacle (robot footprint)
+                                self.grid[ny, nx] = 100
+                            elif dist <= self.inflation_radius:
+                                # Inflated cost (proportional to distance)
+                                cost = 99 * (1.0 - (dist - self.robot_radius) / self.safety_distance)
+                                self.grid[ny, nx] = max(self.grid[ny, nx], cost)
     
     def plan_path(self):
         """Plan path using A* algorithm."""
@@ -206,13 +219,15 @@ class SimpleGlobalPlanner(Node):
                 if not (0 <= nx < self.grid_size and 0 <= ny < self.grid_size):
                     continue
                 
-                # Check obstacle
-                if self.grid[ny, nx] > 50:
+                # Check obstacle (lethal)
+                if self.grid[ny, nx] >= 99:
                     continue
                 
-                # Calculate cost
+                # Calculate cost with strong penalty for high-cost areas
                 move_cost = math.hypot(dx, dy)
-                tentative_g = g + move_cost + self.grid[ny, nx] * 0.01
+                # Exponential cost increase for inflated areas
+                obstacle_cost = self.grid[ny, nx] * 0.1  # Strongly penalize obstacle proximity
+                tentative_g = g + move_cost + obstacle_cost
                 
                 if (nx, ny) not in g_score or tentative_g < g_score[(nx, ny)]:
                     g_score[(nx, ny)] = tentative_g
