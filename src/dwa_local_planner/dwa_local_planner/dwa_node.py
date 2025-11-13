@@ -1,429 +1,321 @@
 #!/usr/bin/env python3
 """
-Simple DWA local planner (ROS 2, rclpy)
+DWA Local Planner node rewritten from `dwa_base.py` logic.
 
-- Subscribes:
-    /odom  (nav_msgs/Odometry)
-    /scan  (sensor_msgs/LaserScan)
-- Publishes:
-    /cmd_vel            (geometry_msgs/Twist)
-    /dwa/trajectories   (visualization_msgs/Marker)  -> all sampled trajectories (faint)
-    /dwa/best_trajectory (visualization_msgs/Marker) -> chosen trajectory (bright)
-Parameters (declared - tune with ros2 param set):
-    max_vel_x, min_vel_x, max_yaw_rate, max_acc_x, max_acc_yaw,
-    v_resolution, omega_resolution, predict_time, dt,
-    robot_radius, obstacle_inflation, min_obstacle_dist,
-    to_goal_cost_gain, speed_cost_gain, obstacle_cost_gain,
-    control_rate, goal_x, goal_y, goal_tolerance
+This node implements a simple Dynamic Window Approach style planner inspired by
+`dwa_base.py`. It samples random (speed, turn) candidates, forward-simulates
+their trajectories from the current odometry, scores them (goal distance,
+heading, collision, smoothness) and publishes the selected velocity as
+`/cmd_vel`. It also publishes a `visualization_msgs/Marker` containing the
+sampled trajectories for RViz.
+
+All tunable values are exposed as ROS2 parameters (inline comments show units
+and guidance). Parameters mirror the variables in `dwa_base.py` where applicable.
 """
+
 import math
+import random
+from typing import List, Tuple
+
 import rclpy
 from rclpy.node import Node
-
+from geometry_msgs.msg import Twist, Point
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist, Point
 from visualization_msgs.msg import Marker
 from tf_transformations import euler_from_quaternion
 
-# ---------- Utility state container ----------
-class State:
-    def __init__(self, x=0.0, y=0.0, yaw=0.0, v=0.0, omega=0.0):
-        self.x = x
-        self.y = y
-        self.yaw = yaw
-        self.v = v
-        self.omega = omega
 
-# ---------- DWA Node ----------
-class SimpleDWA(Node):
+class DWAPlannerNode(Node):
     def __init__(self):
-        super().__init__('simple_dwa')
+        super().__init__('dwa_local_planner')
 
-        # subscriptions
+        # ----------- Declare parameters (inline comments explain each) -----------
+        # maximum forward speed (m/s)
+        # used as upper bound when sampling candidate forward velocities
+        self.declare_parameter('max_speed', 0.15)
+        # maximum absolute turn rate (rad/s)
+        # used as bound for sampled angular velocities
+        self.declare_parameter('max_turn', 2.5)
+        # control loop timestep (s) - also used as integration step
+        self.declare_parameter('step_time', 0.1)
+        # number of candidate (speed,turn) pairs to sample each cycle
+        self.declare_parameter('num_samples', 200)
+        # safety margin used when checking collisions (m)
+        self.declare_parameter('safety_margin', 0.3)
+        # weights for scoring function (larger -> stronger influence)
+        self.declare_parameter('goal_weight', 5.0)
+        self.declare_parameter('heading_weight', 2.0)
+        self.declare_parameter('smoothness_weight', 0.1)
+        self.declare_parameter('obstacle_weight', 1.0)
+        # visualization topic frame
+        self.declare_parameter('visual_frame', 'odom')
+        # goal parameters
+        self.declare_parameter('goal_x', 2.0)
+        self.declare_parameter('goal_y', 1.0)
+        self.declare_parameter('goal_tolerance', 0.05)
+        # number of lookahead steps when simulating each candidate
+        self.declare_parameter('lookahead_steps', 100)
+
+        # ----------- Read parameters into attributes (typed) -------------------
+        self.max_speed = float(self.get_parameter('max_speed').value)
+        self.max_turn = float(self.get_parameter('max_turn').value)
+        self.step_time = float(self.get_parameter('step_time').value)
+        self.num_samples = int(self.get_parameter('num_samples').value)
+        self.safety_margin = float(self.get_parameter('safety_margin').value)
+        self.goal_weight = float(self.get_parameter('goal_weight').value)
+        self.heading_weight = float(self.get_parameter('heading_weight').value)
+        self.smoothness_weight = float(self.get_parameter('smoothness_weight').value)
+        self.obstacle_weight = float(self.get_parameter('obstacle_weight').value)
+        self.visual_frame = str(self.get_parameter('visual_frame').value)
+        self.goal_x = float(self.get_parameter('goal_x').value)
+        self.goal_y = float(self.get_parameter('goal_y').value)
+        self.goal_tolerance = float(self.get_parameter('goal_tolerance').value)
+        self.lookahead_steps = int(self.get_parameter('lookahead_steps').value)
+
+        # ----------- Internal state --------------------------------------------
+        self.odom_msg = None     # latest Odometry message
+        self.scan_msg = None     # latest LaserScan message
+        self.goal_reached = False
+
+        # ----------- ROS interfaces -------------------------------------------
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
-
-        # publishers
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.traj_pub = self.create_publisher(Marker, '/dwa/trajectories', 10)
-        self.best_pub = self.create_publisher(Marker, '/dwa/best_trajectory', 10)
+        self.traj_pub = self.create_publisher(Marker, '/visual_paths', 10)
 
-        # declare tunable parameters (defaults chosen comparable to TurtleBot)
-        self.declare_parameters(
-            namespace='',
-            parameters=[
-                ('max_vel_x', 0.18),                    # maximum forward speed (m/s)
-                ('min_vel_x', -0.05),                   # minimum speed / reverse limit (m/s)
-                ('max_yaw_rate', 1.0),                  # maximum rotation rate (rad/s)
-                ('max_acc_x', 0.2),                     # maximum linear acceleration (m/s²)
-                ('max_acc_yaw', 0.5),                   # maximum angular acceleration (rad/s²)
-                ('v_resolution', 0.02),                 # linear velocity sampling step (m/s)
-                ('omega_resolution', 0.1),              # angular velocity sampling step (rad/s)
-                ('predict_time', 1.8),                  # trajectory lookahead horizon (s)
-                ('dt', 0.1),                            # integration timestep (s)
-                ('robot_radius', 0.22),                 # robot body radius (m)
-                ('obstacle_inflation', 0.05),           # safety margin around obstacles (m)
-                ('min_obstacle_dist', 0.05),            # minimum safe clearance distance (m)
-                ('to_goal_cost_gain', 0.5),             # goal attraction weight (higher = prioritize goal)
-                ('speed_cost_gain', 0.5),               # speed preference weight (higher = prefer faster)
-                ('obstacle_cost_gain', 2.0),            # obstacle avoidance weight (higher = stronger avoidance)
-                ('control_rate', 10.0),                 # control loop frequency (Hz)
-                ('goal_x', 2.0),                        # goal x-coordinate (m, in odom frame)
-                ('goal_y', 1.0),                        # goal y-coordinate (m, in odom frame)
-                ('goal_tolerance', 0.12),               # distance to goal considered reached (m)
-            ])
+        # Timer driven control loop
+        # Use `step_time` as the control loop period for parity with base logic
+        self.create_timer(self.step_time, self.control_loop)
 
-        # read params into locals
-        self.read_params()
+        self.get_logger().info('DWA planner node started')
 
-        # internal state and sensor data
-        self.state = State()                    # current robot pose (x, y, yaw) and velocities (v, omega)
-        self.scan_msg = None                    # latest LaserScan message from /scan subscription
-        self.scan_pts_world = []                # precomputed scan points in world (odom) frame; transformed each time /scan arrives
-        self.goal = (self.goal_x, self.goal_y) # target goal position (x, y) updated when goal_x/goal_y params change
-        self.goal_reached = False               # flag indicating whether robot has reached the goal
-
-        # control timer
-        self.create_timer(1.0 / self.control_rate, self.control_loop)
-
-        self.get_logger().info('Simple DWA node started.')
-
-    def read_params(self):
-        """
-        Fetch all ROS2 parameters and convert to instance variables.
-        Called at startup and in each control loop to support dynamic reconfiguration.
-        """
-        p = self.get_parameters([
-            'max_vel_x', 'min_vel_x', 'max_yaw_rate', 'max_acc_x', 'max_acc_yaw',
-            'v_resolution', 'omega_resolution', 'predict_time', 'dt', 'robot_radius',
-            'obstacle_inflation', 'min_obstacle_dist', 'to_goal_cost_gain', 'speed_cost_gain',
-            'obstacle_cost_gain', 'control_rate', 'goal_x', 'goal_y', 'goal_tolerance'
-        ])
-        d = {x.name: x.value for x in p}
-
-        self.max_vel_x = float(d['max_vel_x'])              # maximum forward speed (m/s)
-        self.min_vel_x = float(d['min_vel_x'])              # minimum speed / reverse limit (m/s)
-        self.max_yaw_rate = float(d['max_yaw_rate'])        # maximum rotation rate (rad/s)
-        self.max_acc_x = float(d['max_acc_x'])              # maximum linear acceleration (m/s²)
-        self.max_acc_yaw = float(d['max_acc_yaw'])          # maximum angular acceleration (rad/s²)
-        self.v_resolution = float(d['v_resolution'])        # linear velocity sampling step (m/s)
-        self.omega_resolution = float(d['omega_resolution']) # angular velocity sampling step (rad/s)
-        self.predict_time = float(d['predict_time'])        # trajectory lookahead horizon (s)
-        self.dt = float(d['dt'])                            # integration timestep (s)
-        self.robot_radius = float(d['robot_radius'])        # robot body radius (m)
-        self.obstacle_inflation = float(d['obstacle_inflation']) # safety margin around obstacles (m)
-        self.min_obstacle_dist = float(d['min_obstacle_dist']) # minimum safe clearance distance (m)
-        self.to_goal_cost_gain = float(d['to_goal_cost_gain'])       # goal attraction weight
-        self.speed_cost_gain = float(d['speed_cost_gain'])           # speed preference weight
-        self.obstacle_cost_gain = float(d['obstacle_cost_gain'])     # obstacle avoidance weight
-        self.control_rate = float(d['control_rate'])        # control loop frequency (Hz)
-        self.goal_x = float(d['goal_x'])                    # goal x-coordinate (m, in odom frame)
-        self.goal_y = float(d['goal_y'])                    # goal y-coordinate (m, in odom frame)
-        self.goal_tolerance = float(d['goal_tolerance'])    # distance to goal considered reached (m)
-
-    # ---------- callbacks ----------
+    # -------------------- Callbacks -----------------------------------------
     def odom_cb(self, msg: Odometry):
-        # update robot pose & velocities
-        p = msg.pose.pose.position
-        o = msg.pose.pose.orientation
-        _, _, yaw = euler_from_quaternion([o.x, o.y, o.z, o.w])
-        self.state.x = p.x
-        self.state.y = p.y
-        self.state.yaw = yaw
-        self.state.v = msg.twist.twist.linear.x
-        self.state.omega = msg.twist.twist.angular.z
+        """Store latest odometry for use in simulation and scoring."""
+        self.odom_msg = msg
 
     def scan_cb(self, msg: LaserScan):
-        # store scan and precompute scan points in world coordinates using current odom (important!)
+        """Store latest scan for collision checking."""
         self.scan_msg = msg
-        self.scan_pts_world = []  # reset
-        if self.state is None:
-            return
 
-        angle = msg.angle_min
-        sx = self.state.x
-        sy = self.state.y
-        syaw = self.state.yaw
+    # -------------------- Core algorithms ----------------------------------
+    def predict_motion(self, speed: float, turn_rate: float) -> List[Tuple[float, float]]:
+        """
+        Forward-simulate a trajectory starting from current odometry using
+        simple unicycle kinematics. Returns a list of (x, y) world coordinates.
+        """
+        if self.odom_msg is None:
+            return []
 
-        for r in msg.ranges:
-            # skip invalid ranges
-            if r is None or math.isinf(r) or math.isnan(r) or r <= 0.0:
-                angle += msg.angle_increment
-                continue
-            # point in robot frame
-            px_r = r * math.cos(angle)
-            py_r = r * math.sin(angle)
-            # transform to world (odom) frame using current robot pose
-            px_w = sx + math.cos(syaw) * px_r - math.sin(syaw) * py_r
-            py_w = sy + math.sin(syaw) * px_r + math.cos(syaw) * py_r
-            self.scan_pts_world.append((px_w, py_w, r))
-            angle += msg.angle_increment
+        x = float(self.odom_msg.pose.pose.position.x)
+        y = float(self.odom_msg.pose.pose.position.y)
+        orient = self.odom_msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([orient.x, orient.y, orient.z, orient.w])
 
-    # ---------- control loop ----------
+        path = []
+        for _ in range(self.lookahead_steps):
+            # integrate
+            x += speed * math.cos(yaw) * self.step_time
+            y += speed * math.sin(yaw) * self.step_time
+            yaw += turn_rate * self.step_time
+            path.append((x, y))
+        return path
+
+    def check_for_collisions(self, path: List[Tuple[float, float]]) -> float:
+        """
+        Return an obstacle-related penalty (lower is better). If any point in
+        the path is too close to an obstacle, return a large negative penalty.
+
+        The method maps world coordinates to robot-relative coordinates using
+        current odometry then looks up the laser range for the heading angle.
+        """
+        if self.scan_msg is None or self.odom_msg is None:
+            # no scan or odom -> cannot reason about obstacles; return neutral small penalty
+            return 0.0
+
+        # laser scan metadata
+        angle_min = float(self.scan_msg.angle_min)
+        angle_inc = float(self.scan_msg.angle_increment)
+        ranges = list(self.scan_msg.ranges)
+        max_range = float(self.scan_msg.range_max)
+
+        rx = float(self.odom_msg.pose.pose.position.x)
+        ry = float(self.odom_msg.pose.pose.position.y)
+        orient = self.odom_msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([orient.x, orient.y, orient.z, orient.w])
+
+        min_dist = float('inf')
+
+        for (px, py) in path:
+            # transform to robot frame
+            dx = px - rx
+            dy = py - ry
+            # rotate into robot frame by -yaw
+            rel_x = math.cos(-yaw) * dx - math.sin(-yaw) * dy
+            rel_y = math.sin(-yaw) * dx + math.cos(-yaw) * dy
+            dist = math.hypot(rel_x, rel_y)
+            angle = math.atan2(rel_y, rel_x)
+            idx = int((angle - angle_min) / angle_inc)
+            if idx < 0 or idx >= len(ranges):
+                # out of scan range -> be conservative and treat as collision
+                return -1e6
+            scan_dist = ranges[idx]
+            if math.isinf(scan_dist) or math.isnan(scan_dist):
+                scan_dist = max_range
+            # if obstacle closer than path point minus safety margin -> collision
+            if scan_dist <= dist - self.safety_margin:
+                return -1e6
+            if dist < min_dist:
+                min_dist = dist
+
+        # safe clearance -> return inverse clearance as penalty (smaller is better)
+        if min_dist == float('inf'):
+            return 0.0
+        return -1.0 / max(min_dist - self.safety_margin, 1e-6)
+
+    def score_trajectory(self, path: List[Tuple[float, float]], turn_rate: float) -> float:
+        """
+        Combine multiple heuristics into a single score (higher = better):
+          - goal proximity (prefer smaller final distance)
+          - heading alignment (prefer facing goal)
+          - obstacle penalty (from check_for_collisions)
+          - smoothness penalty (prefer small angular rates)
+        """
+        if not path:
+            return -float('inf')
+
+        # goal distance score (smaller distance -> higher score)
+        last_x, last_y = path[-1]
+        goal_dist = math.hypot(self.goal_x - last_x, self.goal_y - last_y)
+        goal_score = -self.goal_weight * goal_dist
+
+        # heading score based on current pose
+        if self.odom_msg is None:
+            heading_score = 0.0
+        else:
+            orient = self.odom_msg.pose.pose.orientation
+            _, _, yaw = euler_from_quaternion([orient.x, orient.y, orient.z, orient.w])
+            desired_yaw = math.atan2(self.goal_y - float(self.odom_msg.pose.pose.position.y),
+                                     self.goal_x - float(self.odom_msg.pose.pose.position.x))
+            angle_diff = abs(math.atan2(math.sin(desired_yaw - yaw), math.cos(desired_yaw - yaw)))
+            heading_score = -self.heading_weight * angle_diff
+
+        # obstacle penalty (negative number, lower is worse)
+        obstacle_penalty = self.obstacle_weight * self.check_for_collisions(path)
+
+        # smoothness (penalize larger turn rates)
+        smoothness = -self.smoothness_weight * abs(turn_rate)
+
+        total = goal_score + heading_score + obstacle_penalty + smoothness
+        return total
+
+    def choose_best_path(self, candidates: List[Tuple[float, float, List[Tuple[float, float]]]]) -> Tuple[float, float, List[Tuple[float, float]]]:
+        """
+        Evaluate a list of (speed, turn, path) and return the best triple.
+        """
+        best_score = -float('inf')
+        best = (0.0, 0.0, [])
+
+        for speed, turn, path in candidates:
+            score = self.score_trajectory(path, turn)
+            if score > best_score:
+                best_score = score
+                best = (speed, turn, path)
+        return best
+
+    # -------------------- Control loop ------------------------------------
     def control_loop(self):
-        # refresh parameters in-case changed at runtime
-        self.read_params()
-
-        # if data missing or goal reached, stop
-        if self.scan_msg is None or self.state is None:
+        """Main periodic callback: sample, simulate, score, publish."""
+        # If no sensors present or goal reached, do nothing
+        if self.odom_msg is None or self.scan_msg is None or self.goal_reached:
             return
 
-        if self.is_goal_reached():
+        # Check goal reached first
+        cur_x = float(self.odom_msg.pose.pose.position.x)
+        cur_y = float(self.odom_msg.pose.pose.position.y)
+        if math.hypot(self.goal_x - cur_x, self.goal_y - cur_y) <= self.goal_tolerance:
             if not self.goal_reached:
                 self.get_logger().info(f'Goal reached: ({self.goal_x:.2f}, {self.goal_y:.2f})')
                 self.goal_reached = True
-            self.publish_cmd(0.0, 0.0)
+            # stop the robot
+            self.cmd_pub.publish(Twist())
             return
 
-        # compute dynamic window
-        dw = self.calc_dynamic_window()
+        # Sample candidate controls and predict their trajectories
+        candidates = []
+        for _ in range(self.num_samples):
+            v = random.uniform(0.0, self.max_speed)
+            w = random.uniform(-self.max_turn, self.max_turn)
+            path = self.predict_motion(v, w)
+            candidates.append((v, w, path))
 
-        # search best trajectory
-        best_u, all_trajs = self.search_best_trajectory(dw)
+        # Choose best candidate
+        best_v, best_w, best_path = self.choose_best_path(candidates)
 
-        # visualize sampled trajectories and chosen trajectory
-        self.publish_trajectories_marker(all_trajs, best_u)
+        # Publish chosen velocity
+        move = Twist()
+        move.linear.x = float(best_v)
+        move.angular.z = float(best_w)
+        self.cmd_pub.publish(move)
 
-        if best_u is None:
-            # no valid trajectory -> stop (could add recovery later)
-            self.get_logger().warn('No valid trajectory found; stopping.')
-            self.publish_cmd(0.0, 0.0)
-            return
+        # Publish visualization marker of all candidate paths (faint) and chosen path (bright)
+        marker = Marker()
+        marker.header.frame_id = self.visual_frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = 'dwa_paths'
+        marker.id = 0
+        marker.type = Marker.LINE_LIST
+        marker.action = Marker.ADD
+        marker.scale.x = 0.01
+        marker.color.r = 0.6
+        marker.color.g = 0.6
+        marker.color.b = 0.6
+        marker.color.a = 0.25
 
-        v, omega = best_u
-        self.publish_cmd(v, omega)
-
-    def is_goal_reached(self):
-        dx = self.goal_x - self.state.x
-        dy = self.goal_y - self.state.y
-        return math.hypot(dx, dy) <= self.goal_tolerance
-
-    # ---------- DWA supporting functions ----------
-    def calc_dynamic_window(self):
-        # base limits
-        min_v = self.min_vel_x
-        max_v = self.max_vel_x
-        min_omega = -self.max_yaw_rate
-        max_omega = self.max_yaw_rate
-
-        # dynamic limits based on current speed & accelerations over dt (control timestep)
-        max_v_dyn = self.state.v + self.max_acc_x * self.dt
-        min_v_dyn = self.state.v - self.max_acc_x * self.dt
-        max_omega_dyn = self.state.omega + self.max_acc_yaw * self.dt
-        min_omega_dyn = self.state.omega - self.max_acc_yaw * self.dt
-
-        dw_min_v = max(min_v, min_v_dyn)
-        dw_max_v = min(max_v, max_v_dyn)
-        dw_min_omega = max(min_omega, min_omega_dyn)
-        dw_max_omega = min(max_omega, max_omega_dyn)
-
-        # guard
-        if dw_min_v > dw_max_v:
-            dw_min_v, dw_max_v = min_v, max_v
-        if dw_min_omega > dw_max_omega:
-            dw_min_omega, dw_max_omega = -self.max_yaw_rate, self.max_yaw_rate
-
-        return (dw_min_v, dw_max_v, dw_min_omega, dw_max_omega)
-
-    def generate_trajectory(self, v, omega):
-        # forward-simulate simple unicycle for predict_time using fixed (v,omega)
-        x = self.state.x
-        y = self.state.y
-        yaw = self.state.yaw
-        traj = []
-        t = 0.0
-        while t <= self.predict_time:
-            x += v * math.cos(yaw) * self.dt
-            y += v * math.sin(yaw) * self.dt
-            yaw += omega * self.dt
-            traj.append((x, y, yaw))
-            t += self.dt
-        return traj
-
-    def calc_obstacle_cost(self, traj):
-        """
-        Return an obstacle cost (lower is better). If any pose collides (within inflated radius),
-        return None to mark trajectory invalid.
-        """
-        if not self.scan_pts_world:
-            # no scan data: be conservative but treat it valid with small penalty
-            return 1.0
-
-        inflation = self.robot_radius + self.obstacle_inflation
-        inflation_sq = inflation * inflation
-        min_dist_sq = float('inf')
-
-        # For each pose in trajectory, check distance to each scan point (in world coords)
-        for (x_t, y_t, _) in traj:
-            for (px_w, py_w, _) in self.scan_pts_world:
-                dx = px_w - x_t
-                dy = py_w - y_t
-                d2 = dx * dx + dy * dy
-                if d2 < inflation_sq:
-                    return None  # collision
-                if d2 < min_dist_sq:
-                    min_dist_sq = d2
-
-        if min_dist_sq == float('inf'):
-            return 0.0
-        min_dist = math.sqrt(min_dist_sq)
-        # obstacle cost as inverse of clearance (bigger clearance -> smaller cost)
-        return 1.0 / (max(min_dist - self.obstacle_inflation, 1e-6))
-
-    def calc_to_goal_cost(self, traj):
-        # distance from last pose to goal
-        if not traj:
-            return float('inf')
-        last = traj[-1]
-        dx = self.goal_x - last[0]
-        dy = self.goal_y - last[1]
-        return math.hypot(dx, dy)
-
-    def search_best_trajectory(self, dw):
-        (v_min, v_max, om_min, om_max) = dw
-
-        # sampling counts
-        v_steps = max(1, int(math.ceil((v_max - v_min) / self.v_resolution)))
-        om_steps = max(1, int(math.ceil((om_max - om_min) / self.omega_resolution)))
-
-        best_score = -float('inf')
-        best_u = None
-        all_trajs = []  # list of tuples (v, omega, traj, valid, cost)
-
-        for i in range(v_steps + 1):
-            v = v_min + i * (v_max - v_min) / max(1, v_steps)
-            for j in range(om_steps + 1):
-                omega = om_min + j * (om_max - om_min) / max(1, om_steps)
-                traj = self.generate_trajectory(v, omega)
-
-                # obstacle check
-                ob_cost = self.calc_obstacle_cost(traj)
-                if ob_cost is None:
-                    all_trajs.append((v, omega, traj, False, float('inf')))
-                    continue
-
-                to_goal = self.calc_to_goal_cost(traj)
-                speed_score = v  # prefer higher speed
-                # combine into score (higher better)
-                score = (self.to_goal_cost_gain * (1.0 / (1.0 + to_goal))
-                         + self.speed_cost_gain * speed_score
-                         - self.obstacle_cost_gain * ob_cost)
-
-                all_trajs.append((v, omega, traj, True, score))
-
-                if score > best_score:
-                    best_score = score
-                    best_u = (v, omega)
-
-        return best_u, all_trajs
-
-    # ---------- visualization ----------
-    def publish_trajectories_marker(self, all_trajs, best_u):
-        # Publish all sampled trajectories as faint lines (frame: odom)
-        # and best trajectory as brighter line.
-        # All markers use frame_id 'odom' so they line up with odometry.
-        header_frame = 'odom'
-
-        # All-samples marker (LINE_LIST): each small segment is added consecutively
-        all_marker = Marker()
-        all_marker.header.frame_id = header_frame
-        all_marker.header.stamp = self.get_clock().now().to_msg()
-        all_marker.ns = 'dwa_all'
-        all_marker.id = 0
-        all_marker.type = Marker.LINE_LIST
-        all_marker.action = Marker.ADD
-        all_marker.scale.x = 0.02  # line width
-        all_marker.color.r = 0.6
-        all_marker.color.g = 0.6
-        all_marker.color.b = 0.6
-        all_marker.color.a = 0.35
-
-        # Best trajectory marker (LINE_STRIP)
-        best_marker = Marker()
-        best_marker.header.frame_id = header_frame
-        best_marker.header.stamp = self.get_clock().now().to_msg()
-        best_marker.ns = 'dwa_best'
-        best_marker.id = 1
-        best_marker.type = Marker.LINE_STRIP
-        best_marker.action = Marker.ADD
-        best_marker.scale.x = 0.05
-        best_marker.color.r = 0.0
-        best_marker.color.g = 1.0
-        best_marker.color.b = 0.0
-        best_marker.color.a = 0.9
-
-        # optional: endpoint of best trajectory (sphere)
-        endpoint_marker = Marker()
-        endpoint_marker.header.frame_id = header_frame
-        endpoint_marker.header.stamp = self.get_clock().now().to_msg()
-        endpoint_marker.ns = 'dwa_endpoint'
-        endpoint_marker.id = 2
-        endpoint_marker.type = Marker.SPHERE
-        endpoint_marker.action = Marker.ADD
-        endpoint_marker.scale.x = 0.08
-        endpoint_marker.scale.y = 0.08
-        endpoint_marker.scale.z = 0.08
-        endpoint_marker.color.r = 1.0
-        endpoint_marker.color.g = 0.4
-        endpoint_marker.color.b = 0.0
-        endpoint_marker.color.a = 0.9
-
-        # Build markers
-        best_traj_points = None
-        for (v, omega, traj, valid, score) in all_trajs:
-            # Draw each trajectory as many small segments in LINE_LIST
-            if len(traj) < 2:
+        # append segments for all candidates (sparse to avoid too many points)
+        for _, _, path in candidates:
+            if len(path) < 2:
                 continue
-            # choose color brightness based on validity (we use alpha only through marker)
-            for k in range(len(traj) - 1):
-                p1 = traj[k]
-                p2 = traj[k + 1]
-                pt1 = Point(x=p1[0], y=p1[1], z=0.02)
-                pt2 = Point(x=p2[0], y=p2[1], z=0.02)
-                all_marker.points.append(pt1)
-                all_marker.points.append(pt2)
+            for i in range(len(path) - 1):
+                p1 = Point(x=path[i][0], y=path[i][1], z=0.02)
+                p2 = Point(x=path[i + 1][0], y=path[i + 1][1], z=0.02)
+                marker.points.append(p1)
+                marker.points.append(p2)
 
-            # if this is best trajectory, store for drawing a LINE_STRIP
-            if best_u is not None and math.isclose(v, best_u[0], rel_tol=1e-6) and math.isclose(omega, best_u[1], rel_tol=1e-6):
-                best_traj_points = traj
+        # publish candidates marker
+        self.traj_pub.publish(marker)
 
-        # Fill best_marker if found
-        if best_traj_points is not None:
-            for p in best_traj_points:
-                best_marker.points.append(Point(x=p[0], y=p[1], z=0.03))
-            # endpoint
-            end = best_traj_points[-1]
-            endpoint_marker.pose.position = Point(x=end[0], y=end[1], z=0.03)
-        else:
-            # empty markers (no valid best) - give a tiny empty point to avoid RViz warnings
-            all_marker.points = all_marker.points[:2000]  # safety trim
-
-        # publish
-        self.traj_pub.publish(all_marker)
-        self.best_pub.publish(best_marker)
-        # endpoint as separate marker (helps identify where it's heading)
-        self.best_pub.publish(endpoint_marker)
-
-    # ---------- I/O ----------
-    def publish_cmd(self, v, omega):
-        t = Twist()
-        t.linear.x = float(v)
-        t.angular.z = float(omega)
-        self.cmd_pub.publish(t)
+        # publish chosen path as a separate (brighter) marker
+        if best_path:
+            best_marker = Marker()
+            best_marker.header.frame_id = self.visual_frame
+            best_marker.header.stamp = self.get_clock().now().to_msg()
+            best_marker.ns = 'dwa_best'
+            best_marker.id = 1
+            best_marker.type = Marker.LINE_STRIP
+            best_marker.action = Marker.ADD
+            best_marker.scale.x = 0.04
+            best_marker.color.r = 0.0
+            best_marker.color.g = 1.0
+            best_marker.color.b = 0.0
+            best_marker.color.a = 0.9
+            for (px, py) in best_path:
+                best_marker.points.append(Point(x=px, y=py, z=0.03))
+            self.traj_pub.publish(best_marker)
 
 
-# ---------- main ----------
 def main(args=None):
     rclpy.init(args=args)
-    node = SimpleDWA()
+    node = DWAPlannerNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Shutting down DWA node')
+        pass
     finally:
-        # stop robot before exit
-        node.publish_cmd(0.0, 0.0)
+        # ensure robot stops
+        if node.cmd_pub is not None:
+            node.cmd_pub.publish(Twist())
         node.destroy_node()
         rclpy.shutdown()
 

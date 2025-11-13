@@ -36,8 +36,8 @@ def generate_launch_description():
         PathJoinSubstitution([
             turtlebot3_gazebo_share,
             'launch',
-            #'turtlebot3_world.launch.py'
-            'turtlebot3_dqn_stage1.launch.py'
+            'turtlebot3_world.launch.py'
+            #'turtlebot3_dqn_stage1.launch.py'
         ]),
         launch_arguments={
             'use_sim_time': use_sim_time,
@@ -53,29 +53,46 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'use_sim_time': use_sim_time,                   # Use Gazebo simulation time instead of system time
-            'max_vel_x': float(0.22),                       # Maximum forward speed (m/s) - TurtleBot3 Burger max: 0.22
-            'min_vel_x': float(-0.22),                      # Minimum speed / reverse limit (m/s)
-            'max_yaw_rate': float(2.84),                    # Maximum rotation rate (rad/s) - TurtleBot3 Burger max: 2.84
-            'max_acc_x': float(0.5),                        # Maximum linear acceleration (m/s²)
-            'max_acc_yaw': float(2.0),                      # Maximum angular acceleration (rad/s²)
-            'v_resolution': float(0.02),                    # Linear velocity sampling step (m/s)
-            'omega_resolution': float(0.1),                 # Angular velocity sampling step (rad/s)
-            'predict_time': float(1.5),                     # Trajectory lookahead horizon (s)
-            'dt': float(0.1),                               # Integration timestep (s)
-            'robot_radius': float(0.105),                   # Robot body radius for collision detection (m) - TurtleBot3 Burger radius
-            'obstacle_inflation': float(0.05),              # Safety margin around obstacles (m)
-            'min_obstacle_dist': float(0.10),               # Minimum safe clearance distance (m)
-            'to_goal_cost_gain': float(1.5),                # Goal attraction weight (higher = prioritize goal)
-            'speed_cost_gain': float(0.5),                  # Speed preference weight (higher = prefer faster)
-            'obstacle_cost_gain': float(2.5),               # Obstacle avoidance weight (higher = stronger avoidance)
-            'control_rate': float(10.0),                    # Control loop frequency (Hz)
-            'goal_x': float(1.0),                           # Goal x-coordinate (m, in odom frame)
-            'goal_y': float(0.5),                           # Goal y-coordinate (m, in odom frame)
-            'goal_tolerance': float(0.15),                  # Distance to goal considered reached (m)
-        }]
+            # DWAPlannerNode parameter values (aligned with node defaults)
+            'max_speed': float(0.15),                       # Node default max_speed (m/s)
+            'max_turn': float(2.5),                         # Node default max_turn (rad/s)
+            'step_time': float(0.1),                        # Node default step_time (s)
+            'num_samples': int(200),                        # Node default num_samples
+            'safety_margin': float(0.3),                    # Node default safety_margin (m)
+            'lookahead_steps': int(100),                    # Node default lookahead_steps
+            'goal_x': float(2.0),                           # Node default goal_x (m)
+            'goal_y': float(1.0),                           # Node default goal_y (m)
+            'goal_tolerance': float(0.05),                  # Node default goal_tolerance (m)
+            # scoring weights (node defaults)
+            'goal_weight': float(5.0),
+            'heading_weight': float(2.0),
+            'smoothness_weight': float(0.1),
+            'obstacle_weight': float(1.0),
+            # visualization frame
+            'visual_frame': 'odom',
+            # Legacy params (kept for external compatibility) - aligned when sensible
+            'max_vel_x': float(0.15),
+            'min_vel_x': float(-0.15),
+            'max_yaw_rate': float(2.5),
+            'max_acc_x': float(0.5),
+            'max_acc_yaw': float(2.0),
+            'v_resolution': float(0.02),
+            'omega_resolution': float(0.1),
+            # Keep predict_time consistent with lookahead (predict_time = step_time * lookahead_steps)
+            'predict_time': float(0.1 * 100),
+            'dt': float(0.1),
+            'robot_radius': float(0.105),
+            'obstacle_inflation': float(0.05),
+            'min_obstacle_dist': float(0.10),
+            'to_goal_cost_gain': float(1.5),
+            'speed_cost_gain': float(0.5),
+            'obstacle_cost_gain': float(2.5),
+            'control_rate': float(10.0),
+        }],
+        remappings=[('visual_paths', '/dwa/trajectories')]
     )
 
-    # Delay DWA node start by 2 seconds to ensure Gazebo and sensors are ready
+    # Delay DWA node start by a few seconds to ensure Gazebo and sensors are ready
     delayed_dwa_start = TimerAction(
         period=3.0,
         actions=[dwa_node]
@@ -99,9 +116,9 @@ def generate_launch_description():
         }]
     )
 
-    # Delay RViz start by 5 seconds to allow Gazebo and TurtleBot3 to fully load
+    # Delay RViz start by several seconds to allow Gazebo and TurtleBot3 to fully load
     delayed_rviz_start = TimerAction(
-        period=1.0,
+        period=5.0,
         actions=[rviz_node]
     )
 
@@ -110,7 +127,7 @@ def generate_launch_description():
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(gazebo_launch)
     ld.add_action(delayed_rviz_start)     # RViz starts after 5 seconds
-    ld.add_action(delayed_dwa_start)      # DWA node starts after 2 seconds
+    ld.add_action(delayed_dwa_start)      # DWA node starts after a short delay
    
 
     return ld
