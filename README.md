@@ -35,7 +35,7 @@ colcon build --packages-select dwa_local_planner
 
 2. Launch TurtleBot3 in Gazebo (in a separate terminal):
    ```bash
-   export TURTLEBOT3_MODEL=burger
+   export TURTLEBOT3_MODEL=waffle_pi
    ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
    ```
 
