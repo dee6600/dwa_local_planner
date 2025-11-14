@@ -51,43 +51,47 @@ def generate_launch_description():
         executable='dwa_node',
         name='dwa_local_planner',
         output='screen',
+        # Tuning notes (inline guidance):
+        # - `max_speed`: Increase for faster traversal; lower for safer, more stable control.
+        #   Suggested range: 0.05 - 0.30 m/s for small differential-drive robots.
+        # - `max_turn`: Max angular velocity. Larger values allow quick rotations but
+        #   may produce oscillations. Suggested range: 1.0 - 3.0 rad/s.
+        # - `step_time`: Control loop timestep and integration step. Smaller values
+        #   increase simulation fidelity but cost CPU. Suggested 0.05 - 0.15 s.
+        # - `lookahead_steps`: Number of integration steps per candidate trajectory.
+        #   Combined with `step_time` gives the effective planning horizon
+        #   (`predict_time = step_time * lookahead_steps`). Longer horizons improve
+        #   goal-directed behavior but increase computation and may reduce reactivity.
+        # - `num_samples`: Number of sampled velocity candidates per control cycle.
+        #   Higher -> better coverage and smoother choices, but higher CPU. Try
+        #   100-500; lower on slow hardware.
+        # - `safety_margin`: Extra buffer when checking collisions (m). Increase for
+        #   noisy sensors or to be conservative. Typical: 0.05 - 0.5 m.
+        # - `goal_weight` vs `obstacle_weight`: Larger `goal_weight` makes the
+        #   planner more aggressive toward the goal; larger `obstacle_weight`
+        #   increases conservatism. Tune to trade off speed vs safety.
+        # - `smoothness_weight`: Penalizes high angular rates to encourage smoother
+        #   trajectories. Increase to reduce oscillations.
+        # - `visual_frame`: Frame id for RViz markers. Usually `odom` or `map`.
         parameters=[{
             'use_sim_time': use_sim_time,                   # Use Gazebo simulation time instead of system time
-            # DWAPlannerNode parameter values (aligned with node defaults)
-            'max_speed': float(0.15),                       # Node default max_speed (m/s)
-            'max_turn': float(2.5),                         # Node default max_turn (rad/s)
-            'step_time': float(0.1),                        # Node default step_time (s)
-            'num_samples': int(200),                        # Node default num_samples
-            'safety_margin': float(0.3),                    # Node default safety_margin (m)
-            'lookahead_steps': int(100),                    # Node default lookahead_steps
-            'goal_x': float(2.0),                           # Node default goal_x (m)
-            'goal_y': float(1.0),                           # Node default goal_y (m)
-            'goal_tolerance': float(0.05),                  # Node default goal_tolerance (m)
-            # scoring weights (node defaults)
-            'goal_weight': float(5.0),
-            'heading_weight': float(2.0),
-            'smoothness_weight': float(0.1),
-            'obstacle_weight': float(1.0),
-            # visualization frame
+            # DWAPlannerNode parameter values (tune these for performance/behavior)
+            'max_speed': float(0.10),                       # max forward speed (m/s). Lower -> safer, higher -> faster
+            'max_turn': float(2.5),                         # max angular speed (rad/s). Higher -> quicker rotations
+            'step_time': float(0.1),                        # integration/control timestep (s). Lower -> more precise
+            'num_samples': int(200),                        # number of sampled candidates per cycle; trade CPU vs quality
+            'safety_margin': float(0.3),                    # safety buffer for collision checks (m). Increase for noisy sensors
+            'lookahead_steps': int(300),                    # integration steps per candidate; horizon = step_time * lookahead_steps
+            'goal_x': float(2.0),                           # goal x-coordinate in `visual_frame` (m)
+            'goal_y': float(1.0),                           # goal y-coordinate in `visual_frame` (m)
+            'goal_tolerance': float(0.05),                  # distance to goal considered reached (m)
+            # scoring weights (adjust to change trade-offs):
+            'goal_weight': float(1.0),                      # higher -> prioritize reaching the goal faster
+            'heading_weight': float(0.1),                   # higher -> prefer trajectories pointing towards the goal
+            'smoothness_weight': float(0.1),                # higher -> penalize sharp turns / oscillations
+            'obstacle_weight': float(0.5),                  # higher -> more conservative obstacle avoidance
+            # visualization frame for RViz markers (usually 'odom' or 'map')
             'visual_frame': 'odom',
-            # Legacy params (kept for external compatibility) - aligned when sensible
-            'max_vel_x': float(0.15),
-            'min_vel_x': float(-0.15),
-            'max_yaw_rate': float(2.5),
-            'max_acc_x': float(0.5),
-            'max_acc_yaw': float(2.0),
-            'v_resolution': float(0.02),
-            'omega_resolution': float(0.1),
-            # Keep predict_time consistent with lookahead (predict_time = step_time * lookahead_steps)
-            'predict_time': float(0.1 * 100),
-            'dt': float(0.1),
-            'robot_radius': float(0.105),
-            'obstacle_inflation': float(0.05),
-            'min_obstacle_dist': float(0.10),
-            'to_goal_cost_gain': float(1.5),
-            'speed_cost_gain': float(0.5),
-            'obstacle_cost_gain': float(2.5),
-            'control_rate': float(10.0),
         }],
         remappings=[('visual_paths', '/dwa/trajectories')]
     )
