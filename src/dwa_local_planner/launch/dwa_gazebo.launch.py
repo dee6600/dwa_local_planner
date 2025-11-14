@@ -91,8 +91,8 @@ def generate_launch_description():
             'goal_tolerance': float(0.1),                   # distance tolerance to consider goal reached (m); no orientation requirement
             # ===== Near-Goal Fast Achievement Parameters =====
             'near_goal_distance': float(0.3),               # distance threshold to enable near-goal mode (m)
-            'near_goal_min_speed': float(0.01),             # minimum forward speed in near-goal mode (m/s); enables in-place rotation
-            'near_goal_heading_boost': float(8.0),          # heading weight boost in near-goal mode for faster orientation alignment
+            'near_goal_min_speed': float(0.04),             # minimum forward speed in near-goal mode (m/s); enables in-place rotation
+            'near_goal_heading_boost': float(1.0),          # heading weight boost in near-goal mode for faster orientation alignment
             # ===== Scoring Weights (higher = stronger influence) =====
             'goal_weight': float(2.0),                      # goal proximity weight; higher -> prioritize reaching goal faster
             'heading_weight': float(0.5),                   # heading alignment weight; higher -> prefer facing toward goal
