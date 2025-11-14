@@ -52,7 +52,7 @@ class DWAPlannerNode(Node):
         # goal parameters
         self.declare_parameter('goal_x', 2.0)
         self.declare_parameter('goal_y', 1.0)
-        self.declare_parameter('goal_tolerance', 0.1)
+        self.declare_parameter('goal_tolerance', 0.2)
         # Near-goal fast achievement: distance threshold (m) to enable fast mode
         self.declare_parameter('near_goal_distance', 0.3)
         # In near-goal mode: minimum forward speed (m/s) to allow in-place rotation
@@ -63,6 +63,12 @@ class DWAPlannerNode(Node):
         self.declare_parameter('lookahead_steps', 100)
         # robot physical radius (m) - used for collision checking
         self.declare_parameter('robot_radius', 0.105)
+        # Recovery behavior: time threshold (s) before triggering reverse
+        self.declare_parameter('no_path_timeout', 5.0)
+        # Recovery behavior: reverse duration (s)
+        self.declare_parameter('reverse_duration', 2.0)
+        # Recovery behavior: reverse speed (m/s, negative = backward)
+        self.declare_parameter('reverse_speed', -0.1)
 
         # ----------- Read parameters into attributes (typed) -------------------
         self.max_speed = float(self.get_parameter('max_speed').value)
@@ -82,6 +88,9 @@ class DWAPlannerNode(Node):
         self.near_goal_min_speed = float(self.get_parameter('near_goal_min_speed').value)
         self.near_goal_heading_boost = float(self.get_parameter('near_goal_heading_boost').value)
         self.lookahead_steps = int(self.get_parameter('lookahead_steps').value)
+        self.no_path_timeout = float(self.get_parameter('no_path_timeout').value)
+        self.reverse_duration = float(self.get_parameter('reverse_duration').value)
+        self.reverse_speed = float(self.get_parameter('reverse_speed').value)
 
         # ----------- Internal state --------------------------------------------
         self.odom_msg = None     # latest Odometry message
@@ -93,6 +102,10 @@ class DWAPlannerNode(Node):
         self.use_dynamic_goal = False  # flag to track if dynamic goal is set
         # State for 1 Hz consolidated logging
         self.last_status = {}
+        # Recovery behavior state (reverse when stuck)
+        self.no_valid_path_start_time = None  # timestamp when no valid path first detected
+        self.in_reverse_recovery = False  # flag: currently reversing
+        self.reverse_start_time = None  # timestamp when reverse started
 
         # ----------- ROS interfaces -------------------------------------------
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
@@ -337,6 +350,11 @@ class DWAPlannerNode(Node):
         if self.goal_reached:
             self.get_logger().info('✓ Goal reached, robot stopped')
             return
+        if self.in_reverse_recovery:
+            elapsed = (self.get_clock().now().nanoseconds - self.reverse_start_time) / 1e9
+            remaining = self.reverse_duration - elapsed
+            self.get_logger().info(f'🔄 REVERSE RECOVERY IN PROGRESS: {remaining:.1f}s remaining')
+            return
         if not self.last_status:
             self.get_logger().debug('No trajectory evaluated yet')
             return
@@ -353,6 +371,37 @@ class DWAPlannerNode(Node):
         )
         self.get_logger().info(status_msg)
 
+    # -------------------- Recovery Behavior ---------------------------------
+    def check_reverse_recovery_needed(self) -> bool:
+        """
+        Check if reverse recovery should be triggered.
+        Returns True if no valid path has been found for longer than no_path_timeout.
+        """
+        if self.no_valid_path_start_time is None:
+            return False
+        elapsed = self.get_clock().now().nanoseconds - self.no_valid_path_start_time
+        elapsed_seconds = elapsed / 1e9
+        return elapsed_seconds >= self.no_path_timeout
+
+    def is_reverse_complete(self) -> bool:
+        """
+        Check if reverse recovery period is complete.
+        Returns True if reverse duration has elapsed.
+        """
+        if self.reverse_start_time is None:
+            return False
+        elapsed = self.get_clock().now().nanoseconds - self.reverse_start_time
+        elapsed_seconds = elapsed / 1e9
+        return elapsed_seconds >= self.reverse_duration
+
+    def publish_reverse_command(self):
+        """Publish reverse (backward) motion command."""
+        move = Twist()
+        move.linear.x = float(self.reverse_speed)  # Negative = backward
+        move.angular.z = 0.0  # No rotation while reversing
+        self.cmd_pub.publish(move)
+        self.get_logger().debug(f'🔄 REVERSE RECOVERY: Publishing reverse speed {self.reverse_speed:.3f} m/s')
+
     # -------------------- Control loop ------------------------------------
     def control_loop(self):
         """Main periodic callback: sample, simulate, score, publish."""
@@ -367,6 +416,20 @@ class DWAPlannerNode(Node):
             self.get_logger().debug('✓ Goal already reached, maintaining stop command')
             self.cmd_pub.publish(Twist())
             return
+
+        # ======================= REVERSE RECOVERY STATE MACHINE =======================
+        # Handle reverse recovery if active
+        if self.in_reverse_recovery:
+            if self.is_reverse_complete():
+                # Reverse period complete, exit recovery mode
+                self.get_logger().info('✓ REVERSE RECOVERY COMPLETE: Resuming normal DWA planning')
+                self.in_reverse_recovery = False
+                self.reverse_start_time = None
+                self.no_valid_path_start_time = None  # Reset stuck timer
+            else:
+                # Still in reverse mode, don't calculate paths
+                self.publish_reverse_command()
+                return
 
         # Get current goal (dynamic or parameter-based)
         goal_x, goal_y = self.get_current_goal()
@@ -412,6 +475,37 @@ class DWAPlannerNode(Node):
 
         # Choose best candidate, passing near-goal mode flag
         best_v, best_w, best_path = self.choose_best_path(candidates, in_near_goal)
+
+        # ======================= NO VALID PATH DETECTION =======================
+        # Check if we have valid paths (best_score > -infinity means at least one valid path found)
+        best_score = self.last_status.get('best_score', -float('inf'))
+        if best_score == -float('inf'):
+            # No valid path found
+            if self.no_valid_path_start_time is None:
+                # First time detecting no valid path
+                self.no_valid_path_start_time = self.get_clock().now().nanoseconds
+                self.get_logger().warn(f'⚠️  NO VALID PATH DETECTED: Starting timeout ({self.no_path_timeout}s)')
+            
+            # Check if timeout exceeded
+            if self.check_reverse_recovery_needed():
+                # Timeout exceeded, trigger reverse recovery
+                self.get_logger().warn(
+                    f'🔄 STUCK FOR {self.no_path_timeout}s: Triggering REVERSE RECOVERY ({self.reverse_duration}s) '
+                    f'at reverse speed {self.reverse_speed:.3f} m/s'
+                )
+                self.in_reverse_recovery = True
+                self.reverse_start_time = self.get_clock().now().nanoseconds
+                self.publish_reverse_command()
+                return
+            else:
+                # Timeout not yet exceeded, publish stop command
+                self.cmd_pub.publish(Twist())
+                return
+        else:
+            # Valid path found, reset stuck timer
+            if self.no_valid_path_start_time is not None:
+                self.get_logger().info('✓ Valid path found: Resetting stuck detection')
+                self.no_valid_path_start_time = None
 
         # Publish chosen velocity
         move = Twist()
