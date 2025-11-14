@@ -2,8 +2,7 @@
 """
 DWA Local Planner node rewritten from `dwa_base.py` logic.
 
-This node implements a simple Dynamic Window Approach style planner inspired by
-`dwa_base.py`. It samples random (speed, turn) candidates, forward-simulates
+This node implements a simple Dynamic Window Approach style planner. It samples random (speed, turn) candidates, forward-simulates
 their trajectories from the current odometry, scores them (goal distance,
 heading, collision, smoothness) and publishes the selected velocity as
 `/cmd_vel`. It also publishes a `visualization_msgs/Marker` containing the
