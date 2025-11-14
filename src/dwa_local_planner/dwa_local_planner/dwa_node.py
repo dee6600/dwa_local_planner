@@ -52,7 +52,7 @@ class DWAPlannerNode(Node):
         # goal parameters
         self.declare_parameter('goal_x', 2.0)
         self.declare_parameter('goal_y', 1.0)
-        self.declare_parameter('goal_tolerance', 0.05)
+        self.declare_parameter('goal_tolerance', 0.1)
         # Near-goal fast achievement: distance threshold (m) to enable fast mode
         self.declare_parameter('near_goal_distance', 0.3)
         # In near-goal mode: minimum forward speed (m/s) to allow in-place rotation
@@ -331,7 +331,7 @@ class DWAPlannerNode(Node):
             self.cmd_pub.publish(Twist())
             return
 
-        # Check goal reached first
+        # Check goal reached first (tolerance from parameter, no orientation requirement)
         cur_x = float(self.odom_msg.pose.pose.position.x)
         cur_y = float(self.odom_msg.pose.pose.position.y)
         dist_to_goal = math.hypot(self.goal_x - cur_x, self.goal_y - cur_y)
@@ -339,7 +339,7 @@ class DWAPlannerNode(Node):
             if not self.goal_reached:
                 self.get_logger().info(
                     f'✓ Goal REACHED at ({cur_x:.2f}, {cur_y:.2f}). '
-                    f'Target was ({self.goal_x:.2f}, {self.goal_y:.2f})'
+                    f'Target was ({self.goal_x:.2f}, {self.goal_y:.2f}). Distance: {dist_to_goal:.3f}m'
                 )
                 self.goal_reached = True
             # stop the robot
