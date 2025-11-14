@@ -53,6 +53,12 @@ class DWAPlannerNode(Node):
         self.declare_parameter('goal_x', 2.0)
         self.declare_parameter('goal_y', 1.0)
         self.declare_parameter('goal_tolerance', 0.05)
+        # Near-goal fast achievement: distance threshold (m) to enable fast mode
+        self.declare_parameter('near_goal_distance', 0.3)
+        # In near-goal mode: minimum forward speed (m/s) to allow in-place rotation
+        self.declare_parameter('near_goal_min_speed', 0.01)
+        # In near-goal mode: boost heading weight to prioritize orientation
+        self.declare_parameter('near_goal_heading_boost', 5.0)
         # number of lookahead steps when simulating each candidate
         self.declare_parameter('lookahead_steps', 100)
         # robot physical radius (m) - used for collision checking
@@ -72,6 +78,9 @@ class DWAPlannerNode(Node):
         self.goal_x = float(self.get_parameter('goal_x').value)
         self.goal_y = float(self.get_parameter('goal_y').value)
         self.goal_tolerance = float(self.get_parameter('goal_tolerance').value)
+        self.near_goal_distance = float(self.get_parameter('near_goal_distance').value)
+        self.near_goal_min_speed = float(self.get_parameter('near_goal_min_speed').value)
+        self.near_goal_heading_boost = float(self.get_parameter('near_goal_heading_boost').value)
         self.lookahead_steps = int(self.get_parameter('lookahead_steps').value)
 
         # ----------- Internal state --------------------------------------------
@@ -206,11 +215,11 @@ class DWAPlannerNode(Node):
         )
         return cost
 
-    def score_trajectory(self, path: List[Tuple[float, float]], turn_rate: float) -> float:
+    def score_trajectory(self, path: List[Tuple[float, float]], turn_rate: float, in_near_goal: bool = False) -> float:
         """
         Combine multiple heuristics into a single score (higher = better):
           - goal proximity (prefer smaller final distance)
-          - heading alignment (prefer facing goal)
+          - heading alignment (prefer facing goal) — boosted in near-goal mode
           - obstacle penalty (from check_for_collisions)
           - smoothness penalty (prefer small angular rates)
         """
@@ -223,6 +232,9 @@ class DWAPlannerNode(Node):
         goal_score = -self.goal_weight * goal_dist
 
         # heading score based on current pose
+        # In near-goal mode, boost heading weight to prioritize final orientation
+        heading_weight = self.near_goal_heading_boost if in_near_goal else self.heading_weight
+        
         if self.odom_msg is None:
             heading_score = 0.0
         else:
@@ -231,7 +243,7 @@ class DWAPlannerNode(Node):
             desired_yaw = math.atan2(self.goal_y - float(self.odom_msg.pose.pose.position.y),
                                      self.goal_x - float(self.odom_msg.pose.pose.position.x))
             angle_diff = abs(math.atan2(math.sin(desired_yaw - yaw), math.cos(desired_yaw - yaw)))
-            heading_score = -self.heading_weight * angle_diff
+            heading_score = -heading_weight * angle_diff
 
         # obstacle cost: larger -> worse. If the path collides, reject by returning -inf
         ob_cost = self.check_for_collisions(path)
@@ -252,9 +264,10 @@ class DWAPlannerNode(Node):
         )
         return total
 
-    def choose_best_path(self, candidates: List[Tuple[float, float, List[Tuple[float, float]]]]) -> Tuple[float, float, List[Tuple[float, float]]]:
+    def choose_best_path(self, candidates: List[Tuple[float, float, List[Tuple[float, float]]]], in_near_goal: bool = False) -> Tuple[float, float, List[Tuple[float, float]]]:
         """
         Evaluate a list of (speed, turn, path) and return the best triple.
+        In near-goal mode, heading alignment is prioritized.
         """
         best_score = -float('inf')
         best = (0.0, 0.0, [])
@@ -262,7 +275,7 @@ class DWAPlannerNode(Node):
         collision_count = 0
 
         for speed, turn, path in candidates:
-            score = self.score_trajectory(path, turn)
+            score = self.score_trajectory(path, turn, in_near_goal)
             if score == -float('inf'):
                 collision_count += 1
             else:
@@ -278,6 +291,8 @@ class DWAPlannerNode(Node):
         self.last_status['best_v'] = best_v
         self.last_status['best_w'] = best_w
         self.last_status['best_score'] = best_score
+        if in_near_goal:
+            self.last_status['mode'] = 'near-goal'
         return best
 
     def log_status(self):
@@ -290,8 +305,9 @@ class DWAPlannerNode(Node):
             return
         
         # Consolidated message with all relevant status
+        mode_str = f" [{self.last_status.get('mode', 'normal')}]" if self.last_status.get('mode') else ''
         status_msg = (
-            f'[POS] ({self.last_status.get("pos_x", 0):.2f}, {self.last_status.get("pos_y", 0):.2f}) '
+            f'{mode_str} [POS] ({self.last_status.get("pos_x", 0):.2f}, {self.last_status.get("pos_y", 0):.2f}) '
             f'[DIST] {self.last_status.get("dist_to_goal", 0):.3f}m '
             f'[SCANS] {self.last_status.get("scan_pts", 0)} '
             f'[EVAL] {self.last_status.get("valid_count", 0)} valid, {self.last_status.get("collision_count", 0)} collisions '
@@ -336,17 +352,26 @@ class DWAPlannerNode(Node):
         self.last_status['dist_to_goal'] = dist_to_goal
         self.last_status['scan_pts'] = len(self.scan_pts_world)
 
+        # Determine if we're in near-goal fast-achievement mode
+        in_near_goal = dist_to_goal <= self.near_goal_distance
+        
         # Sample candidate controls and predict their trajectories
-        self.get_logger().debug(f'Sampling {self.num_samples} candidate trajectories...')
+        self.get_logger().debug(f'Sampling {self.num_samples} candidate trajectories... (near_goal={in_near_goal})')
         candidates = []
         for _ in range(self.num_samples):
-            v = random.uniform(0.0, self.max_speed)
-            w = random.uniform(-self.max_turn, self.max_turn)
+            if in_near_goal:
+                # Near goal: allow very low speeds (including near-zero for in-place rotation)
+                v = random.uniform(0.0, self.near_goal_min_speed + 0.02)  # small range around min speed
+                w = random.uniform(-self.max_turn, self.max_turn)  # full turn range
+            else:
+                # Normal mode: standard sampling
+                v = random.uniform(0.0, self.max_speed)
+                w = random.uniform(-self.max_turn, self.max_turn)
             path = self.predict_motion(v, w)
             candidates.append((v, w, path))
 
-        # Choose best candidate
-        best_v, best_w, best_path = self.choose_best_path(candidates)
+        # Choose best candidate, passing near-goal mode flag
+        best_v, best_w, best_path = self.choose_best_path(candidates, in_near_goal)
 
         # Publish chosen velocity
         move = Twist()
