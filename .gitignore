@@ -27,6 +27,9 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Standard ROS packages (not tracked in this repo)
+src/turtlebot3*
+
 # Test results
 *.pytest_cache/
 .coverage
