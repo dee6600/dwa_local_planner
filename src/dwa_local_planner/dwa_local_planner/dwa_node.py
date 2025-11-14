@@ -79,18 +79,27 @@ class DWAPlannerNode(Node):
         self.scan_msg = None     # latest LaserScan message
         self.scan_pts_world = []  # cached scan points in world frame (x,y)
         self.goal_reached = False
+        # State for 1 Hz consolidated logging
+        self.last_status = {}
 
         # ----------- ROS interfaces -------------------------------------------
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.traj_pub = self.create_publisher(Marker, '/visual_paths', 10)
+        self.best_traj_pub = self.create_publisher(Marker, '/dwa/best_trajectory', 10)
 
         # Timer driven control loop
         # Use `step_time` as the control loop period for parity with base logic
         self.create_timer(self.step_time, self.control_loop)
+        # 1 Hz consolidated status logging
+        self.create_timer(1.0, self.log_status)
 
-        self.get_logger().info('DWA planner node started')
+        self.get_logger().info(
+            f'DWA planner node started. Goal: ({self.goal_x:.2f}, {self.goal_y:.2f}). '
+            f'Max speed: {self.max_speed} m/s, Max turn: {self.max_turn} rad/s, '
+            f'Samples: {self.num_samples}, Lookahead: {self.lookahead_steps} steps'
+        )
 
     # -------------------- Callbacks -----------------------------------------
     def odom_cb(self, msg: Odometry):
@@ -164,6 +173,7 @@ class DWAPlannerNode(Node):
         inflation = float(self.get_parameter('robot_radius').value) + float(self.get_parameter('safety_margin').value)
         inflation_sq = inflation * inflation
         min_dist_sq = float('inf')
+        collision_point = None
 
         # For each path point, check distance to each obstacle point (scan point in world)
         for (px, py) in path:
@@ -172,10 +182,17 @@ class DWAPlannerNode(Node):
                 dy = oy - py
                 d2 = dx * dx + dy * dy
                 if d2 < inflation_sq:
-                    # collision
+                    # collision detected
+                    collision_dist = math.sqrt(d2)
+                    self.get_logger().debug(
+                        f'Collision detected: path point ({px:.3f}, {py:.3f}) '
+                        f'too close to obstacle ({ox:.3f}, {oy:.3f}), '
+                        f'distance={collision_dist:.3f}m < inflation={inflation:.3f}m'
+                    )
                     return None
                 if d2 < min_dist_sq:
                     min_dist_sq = d2
+                    collision_point = (ox, oy)
 
         if min_dist_sq == float('inf'):
             return 0.0
@@ -183,7 +200,11 @@ class DWAPlannerNode(Node):
         min_dist = math.sqrt(min_dist_sq)
         # cost increases as clearance decreases
         clearance = max(min_dist - float(self.get_parameter('safety_margin').value), 1e-6)
-        return 1.0 / clearance
+        cost = 1.0 / clearance
+        self.get_logger().debug(
+            f'Path safety: min_dist={min_dist:.3f}m, clearance={clearance:.3f}m, obstacle_cost={cost:.3f}'
+        )
+        return cost
 
     def score_trajectory(self, path: List[Tuple[float, float]], turn_rate: float) -> float:
         """
@@ -215,6 +236,7 @@ class DWAPlannerNode(Node):
         # obstacle cost: larger -> worse. If the path collides, reject by returning -inf
         ob_cost = self.check_for_collisions(path)
         if ob_cost is None:
+            self.get_logger().debug('Trajectory rejected: COLLISION')
             return -float('inf')
         obstacle_penalty = -self.obstacle_weight * ob_cost
 
@@ -222,6 +244,12 @@ class DWAPlannerNode(Node):
         smoothness = -self.smoothness_weight * abs(turn_rate)
 
         total = goal_score + heading_score + obstacle_penalty + smoothness
+        self.get_logger().debug(
+            f'Score breakdown: goal_score={goal_score:.3f} (dist={goal_dist:.3f}m), '
+            f'heading_score={heading_score:.3f} (angle_diff={angle_diff:.3f}rad), '
+            f'obstacle_penalty={obstacle_penalty:.3f}, smoothness={smoothness:.3f}, '
+            f'TOTAL={total:.3f}'
+        )
         return total
 
     def choose_best_path(self, candidates: List[Tuple[float, float, List[Tuple[float, float]]]]) -> Tuple[float, float, List[Tuple[float, float]]]:
@@ -230,33 +258,86 @@ class DWAPlannerNode(Node):
         """
         best_score = -float('inf')
         best = (0.0, 0.0, [])
+        valid_count = 0
+        collision_count = 0
 
         for speed, turn, path in candidates:
             score = self.score_trajectory(path, turn)
-            if score > best_score:
-                best_score = score
-                best = (speed, turn, path)
+            if score == -float('inf'):
+                collision_count += 1
+            else:
+                valid_count += 1
+                if score > best_score:
+                    best_score = score
+                    best = (speed, turn, path)
+        
+        best_v, best_w, best_path = best
+        # Store for 1 Hz consolidated logging (not logged here)
+        self.last_status['valid_count'] = valid_count
+        self.last_status['collision_count'] = collision_count
+        self.last_status['best_v'] = best_v
+        self.last_status['best_w'] = best_w
+        self.last_status['best_score'] = best_score
         return best
+
+    def log_status(self):
+        """Consolidated 1 Hz status log combining robot state and trajectory evaluation."""
+        if self.goal_reached:
+            self.get_logger().info('✓ Goal reached, robot stopped')
+            return
+        if not self.last_status:
+            self.get_logger().debug('No trajectory evaluated yet')
+            return
+        
+        # Consolidated message with all relevant status
+        status_msg = (
+            f'[POS] ({self.last_status.get("pos_x", 0):.2f}, {self.last_status.get("pos_y", 0):.2f}) '
+            f'[DIST] {self.last_status.get("dist_to_goal", 0):.3f}m '
+            f'[SCANS] {self.last_status.get("scan_pts", 0)} '
+            f'[EVAL] {self.last_status.get("valid_count", 0)} valid, {self.last_status.get("collision_count", 0)} collisions '
+            f'[CMD] v={self.last_status.get("best_v", 0):.3f}m/s ω={self.last_status.get("best_w", 0):.3f}rad/s '
+            f'[SCORE] {self.last_status.get("best_score", 0):.2f}'
+        )
+        self.get_logger().info(status_msg)
 
     # -------------------- Control loop ------------------------------------
     def control_loop(self):
         """Main periodic callback: sample, simulate, score, publish."""
         # If no sensors present or goal reached, do nothing
-        if self.odom_msg is None or self.scan_msg is None or self.goal_reached:
+        if self.odom_msg is None:
+            self.get_logger().debug('⏳ Waiting for odometry message...')
+            return
+        if self.scan_msg is None:
+            self.get_logger().debug('⏳ Waiting for laser scan message...')
+            return
+        if self.goal_reached:
+            self.get_logger().debug('✓ Goal already reached, maintaining stop command')
+            self.cmd_pub.publish(Twist())
             return
 
         # Check goal reached first
         cur_x = float(self.odom_msg.pose.pose.position.x)
         cur_y = float(self.odom_msg.pose.pose.position.y)
-        if math.hypot(self.goal_x - cur_x, self.goal_y - cur_y) <= self.goal_tolerance:
+        dist_to_goal = math.hypot(self.goal_x - cur_x, self.goal_y - cur_y)
+        if dist_to_goal <= self.goal_tolerance:
             if not self.goal_reached:
-                self.get_logger().info(f'Goal reached: ({self.goal_x:.2f}, {self.goal_y:.2f})')
+                self.get_logger().info(
+                    f'✓ Goal REACHED at ({cur_x:.2f}, {cur_y:.2f}). '
+                    f'Target was ({self.goal_x:.2f}, {self.goal_y:.2f})'
+                )
                 self.goal_reached = True
             # stop the robot
             self.cmd_pub.publish(Twist())
             return
+        
+        # Update status cache for 1 Hz logging
+        self.last_status['pos_x'] = cur_x
+        self.last_status['pos_y'] = cur_y
+        self.last_status['dist_to_goal'] = dist_to_goal
+        self.last_status['scan_pts'] = len(self.scan_pts_world)
 
         # Sample candidate controls and predict their trajectories
+        self.get_logger().debug(f'Sampling {self.num_samples} candidate trajectories...')
         candidates = []
         for _ in range(self.num_samples):
             v = random.uniform(0.0, self.max_speed)
@@ -300,38 +381,41 @@ class DWAPlannerNode(Node):
         # publish candidates marker
         self.traj_pub.publish(marker)
 
-        # publish chosen path as a separate (brighter) marker
+        # publish chosen path as a separate (brighter) marker on dedicated topic
         if best_path:
             best_marker = Marker()
             best_marker.header.frame_id = self.visual_frame
             best_marker.header.stamp = self.get_clock().now().to_msg()
             best_marker.ns = 'dwa_best'
-            best_marker.id = 1
+            best_marker.id = 0
             best_marker.type = Marker.LINE_STRIP
             best_marker.action = Marker.ADD
-            best_marker.scale.x = 0.04
+            best_marker.scale.x = 0.05
             best_marker.color.r = 0.0
             best_marker.color.g = 1.0
             best_marker.color.b = 0.0
-            best_marker.color.a = 0.9
+            best_marker.color.a = 0.95
             for (px, py) in best_path:
                 best_marker.points.append(Point(x=px, y=py, z=0.03))
-            self.traj_pub.publish(best_marker)
+            self.best_traj_pub.publish(best_marker)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = DWAPlannerNode()
+    node.get_logger().info('DWA planner node spinning... (Ctrl+C to stop)')
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info('Interrupted by user (Ctrl+C)')
     finally:
+        node.get_logger().info('Shutting down DWA planner node; stopping robot')
         # ensure robot stops
         if node.cmd_pub is not None:
             node.cmd_pub.publish(Twist())
         node.destroy_node()
         rclpy.shutdown()
+        print('\n[DWA] Node fully shut down')
 
 
 if __name__ == '__main__':
