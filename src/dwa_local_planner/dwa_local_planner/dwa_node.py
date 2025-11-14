@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, Point
+from geometry_msgs.msg import Twist, Point, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
@@ -88,12 +88,17 @@ class DWAPlannerNode(Node):
         self.scan_msg = None     # latest LaserScan message
         self.scan_pts_world = []  # cached scan points in world frame (x,y)
         self.goal_reached = False
+        # Dynamic goal state (from RViz or topic)
+        self.dynamic_goal = None  # (goal_x, goal_y) tuple from /goal_pose topic
+        self.use_dynamic_goal = False  # flag to track if dynamic goal is set
         # State for 1 Hz consolidated logging
         self.last_status = {}
 
         # ----------- ROS interfaces -------------------------------------------
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
+        # Subscribe to standard ROS 2 goal topic for RViz integration
+        self.create_subscription(PoseStamped, '/goal_pose', self.goal_pose_cb, 10)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.traj_pub = self.create_publisher(Marker, '/visual_paths', 10)
         self.best_traj_pub = self.create_publisher(Marker, '/dwa/best_trajectory', 10)
@@ -105,12 +110,41 @@ class DWAPlannerNode(Node):
         self.create_timer(1.0, self.log_status)
 
         self.get_logger().info(
-            f'DWA planner node started. Goal: ({self.goal_x:.2f}, {self.goal_y:.2f}). '
+            f'DWA planner node started. '
+            f'Default goal: ({self.goal_x:.2f}, {self.goal_y:.2f}). '
             f'Max speed: {self.max_speed} m/s, Max turn: {self.max_turn} rad/s, '
-            f'Samples: {self.num_samples}, Lookahead: {self.lookahead_steps} steps'
+            f'Samples: {self.num_samples}, Lookahead: {self.lookahead_steps} steps. '
+            f'Listening for goals on /goal_pose (RViz compatible).'
         )
 
-    # -------------------- Callbacks -----------------------------------------
+    # -------------------- Goal Handling -----------------------------------------
+    def goal_pose_cb(self, msg: PoseStamped):
+        """
+        Callback for /goal_pose topic (standard ROS 2 format).
+        Enables goal setting from:
+        1. RViz "2D Goal Pose" button
+        2. ros2 topic pub /goal_pose ...
+        3. Launch file with direct topic publishing
+        """
+        self.dynamic_goal = (
+            float(msg.pose.position.x),
+            float(msg.pose.position.y)
+        )
+        self.use_dynamic_goal = True
+        self.goal_reached = False  # Reset goal reached flag for new goal
+        self.get_logger().info(
+            f'🎯 New goal received from /goal_pose: ({self.dynamic_goal[0]:.2f}, {self.dynamic_goal[1]:.2f})'
+        )
+
+    def get_current_goal(self) -> Tuple[float, float]:
+        """
+        Get current goal, prioritizing dynamic goals from /goal_pose over parameters.
+        Returns: (goal_x, goal_y) tuple
+        """
+        if self.use_dynamic_goal and self.dynamic_goal is not None:
+            return self.dynamic_goal
+        # Fall back to parameter-based goal
+        return (self.goal_x, self.goal_y)
     def odom_cb(self, msg: Odometry):
         """Store latest odometry for use in simulation and scoring."""
         self.odom_msg = msg
@@ -226,9 +260,12 @@ class DWAPlannerNode(Node):
         if not path:
             return -float('inf')
 
+        # Get current goal (dynamic or parameter-based)
+        goal_x, goal_y = self.get_current_goal()
+
         # goal distance score (smaller distance -> higher score)
         last_x, last_y = path[-1]
-        goal_dist = math.hypot(self.goal_x - last_x, self.goal_y - last_y)
+        goal_dist = math.hypot(goal_x - last_x, goal_y - last_y)
         goal_score = -self.goal_weight * goal_dist
 
         # heading score based on current pose
@@ -240,8 +277,8 @@ class DWAPlannerNode(Node):
         else:
             orient = self.odom_msg.pose.pose.orientation
             _, _, yaw = euler_from_quaternion([orient.x, orient.y, orient.z, orient.w])
-            desired_yaw = math.atan2(self.goal_y - float(self.odom_msg.pose.pose.position.y),
-                                     self.goal_x - float(self.odom_msg.pose.pose.position.x))
+            desired_yaw = math.atan2(goal_y - float(self.odom_msg.pose.pose.position.y),
+                                     goal_x - float(self.odom_msg.pose.pose.position.x))
             angle_diff = abs(math.atan2(math.sin(desired_yaw - yaw), math.cos(desired_yaw - yaw)))
             heading_score = -heading_weight * angle_diff
 
@@ -331,15 +368,18 @@ class DWAPlannerNode(Node):
             self.cmd_pub.publish(Twist())
             return
 
+        # Get current goal (dynamic or parameter-based)
+        goal_x, goal_y = self.get_current_goal()
+
         # Check goal reached first (tolerance from parameter, no orientation requirement)
         cur_x = float(self.odom_msg.pose.pose.position.x)
         cur_y = float(self.odom_msg.pose.pose.position.y)
-        dist_to_goal = math.hypot(self.goal_x - cur_x, self.goal_y - cur_y)
+        dist_to_goal = math.hypot(goal_x - cur_x, goal_y - cur_y)
         if dist_to_goal <= self.goal_tolerance:
             if not self.goal_reached:
                 self.get_logger().info(
                     f'✓ Goal REACHED at ({cur_x:.2f}, {cur_y:.2f}). '
-                    f'Target was ({self.goal_x:.2f}, {self.goal_y:.2f}). Distance: {dist_to_goal:.3f}m'
+                    f'Target was ({goal_x:.2f}, {goal_y:.2f}). Distance: {dist_to_goal:.3f}m'
                 )
                 self.goal_reached = True
             # stop the robot
