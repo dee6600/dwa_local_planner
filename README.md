@@ -27,7 +27,33 @@ This project provides a production-ready **single-file DWA local planner** optim
 
 ---
 
-## 📋 Prerequisites
+## � Demo Videos
+
+Watch the DWA planner in action:
+
+### Video 1: Basic Navigation
+
+<div align="center">
+  <a href="https://youtu.be/EFQdvRkKTbI">
+    <img src="https://img.youtube.com/vi/EFQdvRkKTbI/hqdefault.jpg" alt="DWA Planner Demo 1" width="300" />
+  </a>
+  <br />
+  <a href="https://youtu.be/EFQdvRkKTbI">Watch on YouTube</a>
+</div>
+
+### Video 2: Obstacle Avoidance
+
+<div align="center">
+  <a href="https://youtu.be/Ewr2yz8dGMg">
+    <img src="https://img.youtube.com/vi/Ewr2yz8dGMg/hqdefault.jpg" alt="DWA Planner Demo 2" width="300" />
+  </a>
+  <br />
+  <a href="https://youtu.be/Ewr2yz8dGMg">Watch on YouTube</a>
+</div>
+
+---
+
+## �📋 Prerequisites
 
 - **ROS 2** (Humble/Foxy or later)
 - **TurtleBot3** simulation packages
