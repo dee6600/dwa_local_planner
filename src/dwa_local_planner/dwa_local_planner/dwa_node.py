@@ -55,6 +55,8 @@ class DWAPlannerNode(Node):
         self.declare_parameter('goal_tolerance', 0.05)
         # number of lookahead steps when simulating each candidate
         self.declare_parameter('lookahead_steps', 100)
+        # robot physical radius (m) - used for collision checking
+        self.declare_parameter('robot_radius', 0.105)
 
         # ----------- Read parameters into attributes (typed) -------------------
         self.max_speed = float(self.get_parameter('max_speed').value)
@@ -75,6 +77,7 @@ class DWAPlannerNode(Node):
         # ----------- Internal state --------------------------------------------
         self.odom_msg = None     # latest Odometry message
         self.scan_msg = None     # latest LaserScan message
+        self.scan_pts_world = []  # cached scan points in world frame (x,y)
         self.goal_reached = False
 
         # ----------- ROS interfaces -------------------------------------------
@@ -95,8 +98,30 @@ class DWAPlannerNode(Node):
         self.odom_msg = msg
 
     def scan_cb(self, msg: LaserScan):
-        """Store latest scan for collision checking."""
+        """Store latest scan and precompute scan points in world frame for collision checking."""
         self.scan_msg = msg
+        self.scan_pts_world = []
+        # need odometry to transform scan points into world frame
+        if self.odom_msg is None:
+            return
+        rx = float(self.odom_msg.pose.pose.position.x)
+        ry = float(self.odom_msg.pose.pose.position.y)
+        orient = self.odom_msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([orient.x, orient.y, orient.z, orient.w])
+
+        angle = float(msg.angle_min)
+        for r in msg.ranges:
+            if r is None or math.isinf(r) or math.isnan(r) or r <= 0.0:
+                angle += float(msg.angle_increment)
+                continue
+            # point in robot frame
+            px_r = r * math.cos(angle)
+            py_r = r * math.sin(angle)
+            # transform to world (odom) frame using current robot pose
+            px_w = rx + math.cos(yaw) * px_r - math.sin(yaw) * py_r
+            py_w = ry + math.sin(yaw) * px_r + math.cos(yaw) * py_r
+            self.scan_pts_world.append((px_w, py_w))
+            angle += float(msg.angle_increment)
 
     # -------------------- Core algorithms ----------------------------------
     def predict_motion(self, speed: float, turn_rate: float) -> List[Tuple[float, float]]:
@@ -123,55 +148,42 @@ class DWAPlannerNode(Node):
 
     def check_for_collisions(self, path: List[Tuple[float, float]]) -> float:
         """
-        Return an obstacle-related penalty (lower is better). If any point in
-        the path is too close to an obstacle, return a large negative penalty.
+        Check a candidate path against precomputed scan points (world frame).
 
-        The method maps world coordinates to robot-relative coordinates using
-        current odometry then looks up the laser range for the heading angle.
+        Returns:
+          - `None` if the path collides (too close to an obstacle considering robot radius)
+          - a positive obstacle cost (higher = worse) otherwise. The cost is
+            inverse to the minimum clearance along the path: 1 / clearance.
         """
-        if self.scan_msg is None or self.odom_msg is None:
-            # no scan or odom -> cannot reason about obstacles; return neutral small penalty
+        if not path:
+            return 0.0
+        if not self.scan_pts_world:
+            # no scan data available -> neutral cost
             return 0.0
 
-        # laser scan metadata
-        angle_min = float(self.scan_msg.angle_min)
-        angle_inc = float(self.scan_msg.angle_increment)
-        ranges = list(self.scan_msg.ranges)
-        max_range = float(self.scan_msg.range_max)
+        inflation = float(self.get_parameter('robot_radius').value) + float(self.get_parameter('safety_margin').value)
+        inflation_sq = inflation * inflation
+        min_dist_sq = float('inf')
 
-        rx = float(self.odom_msg.pose.pose.position.x)
-        ry = float(self.odom_msg.pose.pose.position.y)
-        orient = self.odom_msg.pose.pose.orientation
-        _, _, yaw = euler_from_quaternion([orient.x, orient.y, orient.z, orient.w])
-
-        min_dist = float('inf')
-
+        # For each path point, check distance to each obstacle point (scan point in world)
         for (px, py) in path:
-            # transform to robot frame
-            dx = px - rx
-            dy = py - ry
-            # rotate into robot frame by -yaw
-            rel_x = math.cos(-yaw) * dx - math.sin(-yaw) * dy
-            rel_y = math.sin(-yaw) * dx + math.cos(-yaw) * dy
-            dist = math.hypot(rel_x, rel_y)
-            angle = math.atan2(rel_y, rel_x)
-            idx = int((angle - angle_min) / angle_inc)
-            if idx < 0 or idx >= len(ranges):
-                # out of scan range -> be conservative and treat as collision
-                return -1e6
-            scan_dist = ranges[idx]
-            if math.isinf(scan_dist) or math.isnan(scan_dist):
-                scan_dist = max_range
-            # if obstacle closer than path point minus safety margin -> collision
-            if scan_dist <= dist - self.safety_margin:
-                return -1e6
-            if dist < min_dist:
-                min_dist = dist
+            for (ox, oy) in self.scan_pts_world:
+                dx = ox - px
+                dy = oy - py
+                d2 = dx * dx + dy * dy
+                if d2 < inflation_sq:
+                    # collision
+                    return None
+                if d2 < min_dist_sq:
+                    min_dist_sq = d2
 
-        # safe clearance -> return inverse clearance as penalty (smaller is better)
-        if min_dist == float('inf'):
+        if min_dist_sq == float('inf'):
             return 0.0
-        return -1.0 / max(min_dist - self.safety_margin, 1e-6)
+
+        min_dist = math.sqrt(min_dist_sq)
+        # cost increases as clearance decreases
+        clearance = max(min_dist - float(self.get_parameter('safety_margin').value), 1e-6)
+        return 1.0 / clearance
 
     def score_trajectory(self, path: List[Tuple[float, float]], turn_rate: float) -> float:
         """
@@ -200,8 +212,11 @@ class DWAPlannerNode(Node):
             angle_diff = abs(math.atan2(math.sin(desired_yaw - yaw), math.cos(desired_yaw - yaw)))
             heading_score = -self.heading_weight * angle_diff
 
-        # obstacle penalty (negative number, lower is worse)
-        obstacle_penalty = self.obstacle_weight * self.check_for_collisions(path)
+        # obstacle cost: larger -> worse. If the path collides, reject by returning -inf
+        ob_cost = self.check_for_collisions(path)
+        if ob_cost is None:
+            return -float('inf')
+        obstacle_penalty = -self.obstacle_weight * ob_cost
 
         # smoothness (penalize larger turn rates)
         smoothness = -self.smoothness_weight * abs(turn_rate)

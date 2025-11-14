@@ -76,19 +76,19 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': use_sim_time,                   # Use Gazebo simulation time instead of system time
             # DWAPlannerNode parameter values (tune these for performance/behavior)
-            'max_speed': float(0.10),                       # max forward speed (m/s). Lower -> safer, higher -> faster
+            'max_speed': float(0.15),                       # max forward speed (m/s). Lower -> safer, higher -> faster
             'max_turn': float(2.5),                         # max angular speed (rad/s). Higher -> quicker rotations
             'step_time': float(0.1),                        # integration/control timestep (s). Lower -> more precise
             'num_samples': int(200),                        # number of sampled candidates per cycle; trade CPU vs quality
-            'safety_margin': float(0.3),                    # safety buffer for collision checks (m). Increase for noisy sensors
-            'lookahead_steps': int(300),                    # integration steps per candidate; horizon = step_time * lookahead_steps
+            'safety_margin': float(0.1),                    # safety buffer for collision checks (m). Increase for noisy sensors
+            'lookahead_steps': int(50),                    # integration steps per candidate; horizon = step_time * lookahead_steps
             'goal_x': float(2.0),                           # goal x-coordinate in `visual_frame` (m)
             'goal_y': float(1.0),                           # goal y-coordinate in `visual_frame` (m)
             'goal_tolerance': float(0.05),                  # distance to goal considered reached (m)
             # scoring weights (adjust to change trade-offs):
-            'goal_weight': float(1.0),                      # higher -> prioritize reaching the goal faster
-            'heading_weight': float(0.1),                   # higher -> prefer trajectories pointing towards the goal
-            'smoothness_weight': float(0.1),                # higher -> penalize sharp turns / oscillations
+            'goal_weight': float(2.0),                      # higher -> prioritize reaching the goal faster
+            'heading_weight': float(0.5),                   # higher -> prefer trajectories pointing towards the goal
+            'smoothness_weight': float(0.5),                # higher -> penalize sharp turns / oscillations
             'obstacle_weight': float(0.5),                  # higher -> more conservative obstacle avoidance
             # visualization frame for RViz markers (usually 'odom' or 'map')
             'visual_frame': 'odom',
