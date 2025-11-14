@@ -1,108 +1,96 @@
 ## DWA Local Planner — Copilot Instructions
 
-Purpose: give AI coding agents the minimal, actionable context to be productive in this ROS2 ament_python package.
+**Purpose:** Minimal, actionable guidance for AI coding agents to be productive in this ROS2 ament_python project.
 
-- Repo type: ROS2 workspace (ament_python package) located under `src/dwa_local_planner`.
-- Primary language: Python 3. Uses `rclpy`, ROS message types and numpy for numeric code.
+### Repo Overview
+- **Type:** ROS2 workspace with single ament_python package at `src/dwa_local_planner`.
+- **Language:** Python 3 (rclpy, geometry_msgs, nav_msgs, sensor_msgs).
+- **Architecture:** Dynamic Window Approach (DWA) local planner as a single-file node (`dwa_node.py`).
 
-Quick commands (run from workspace root):
+### Quick Commands (run from workspace root)
+```bash
+colcon build --packages-select dwa_local_planner
+source install/setup.bash  # or install/local_setup.bash for session-local
+ros2 run dwa_local_planner dwa_node
+colcon test --packages-select dwa_local_planner && colcon test-result --verbose
+```
 
-- Build package: `colcon build --packages-select dwa_local_planner`
-- Source install overlay: `source install/setup.bash` (or `local_setup.bash` for session-local)
-- Run node: `ros2 run dwa_local_planner dwa_node` (exposed via `console_scripts` in `setup.py`)
-- Run tests: `colcon test --packages-select dwa_local_planner` then `colcon test-result --verbose`
+### Big Picture Architecture
 
-Where to look first
+**Data Flow:**
+1. **Sensors:** Subscribe to `/odom` (Odometry) and `/scan` (LaserScan) in robot frame
+2. **Planning:** Sample candidate (speed, turn_rate) pairs; forward-simulate trajectories using unicycle kinematics (Euler integration)
+3. **Scoring:** Evaluate each trajectory on goal distance, heading, clearance from obstacles, and smoothness
+4. **Output:** Publish best velocity command to `/cmd_vel` (Twist)
 
-- Node implementation: `src/dwa_local_planner/dwa_local_planner/dwa_node.py` — this is the single-file demo planner. Key items:
-  - `class DWALocalPlanner(Node)` — rclpy Node using `create_subscription`, `create_publisher`, `create_timer`.
-  - Hardcoded goal: `self.goal = np.array([2.0, 0.0])` in `__init__` — change here for quick demos.
-  - Entry point: `main()` at bottom; packaged as `dwa_node` in `setup.py`.
-  - Laser handling: `scan_cb` normalizes NaN/Inf with `msg.range_max` — follow this pattern when working with scans.
-  - Collision check maps angles to scan indices using `scan_angle_min` and `scan_angle_increment`.
+**Design Rationale:** Single-file implementation for clarity and experimentation. All tunable parameters are exposed as ROS2 parameters (declared and read in `__init__`).
 
-- Packaging and metadata: `src/dwa_local_planner/setup.py` and `package.xml`
-  - `package.xml` declares runtime deps (`rclpy`, `geometry_msgs`, `nav_msgs`, `sensor_msgs`) and `build_type` = `ament_python`.
-  - `setup.py` registers the console script: `'dwa_node = dwa_local_planner.dwa_node:main'`.
-  - Note: dependencies are declared in `package.xml` (ROS/ament) rather than `setup.py`.
+### Where to Look First
 
-Conventions and patterns to follow (project-specific)
+**`src/dwa_local_planner/dwa_local_planner/dwa_node.py`** — Core planner (only ~450 lines):
+- **`class DWAPlannerNode(Node)`:** Main entry point; uses `create_subscription`, `create_publisher`, `create_timer`.
+- **`scan_cb` method:** Transforms laser scans (robot frame) to world coordinates. Replaces NaN/Inf with valid range data.
+- **`predict_motion` method:** Unicycle kinematics + Euler integration over `lookahead_steps` to simulate candidate trajectories.
+- **`check_for_collisions` method:** Compares trajectory path to precomputed world-frame scan points; returns infinity cost on collision (or inverse clearance otherwise).
+- **`control_loop` method:** Main callback; samples velocities, simulates, scores, and publishes best command.
 
-- Use `rclpy.Node` idioms already in the node: `create_subscription(...)`, `create_publisher(...)`, and `create_timer(...)`.
-- Sensor preprocessing: convert `msg.ranges` to numpy, replace NaN/Inf with `msg.range_max` (see `scan_cb`). Keep this when adding algorithms that read scans.
-- Trajectory prediction uses a simple Euler integration loop (`predict_trajectory`). Prefer clarity and small, well-tested helper functions when refactoring.
-- Collision check is conservative: if angle index is out-of-range, the code treats it as collision — keep that safety assumption when modifying behavior.
+**Key Parameters** (all ROS2 params, tunable at runtime or via launch file):
+- `max_speed`, `max_turn`: Robot kinematic limits
+- `num_samples`: How many (v, ω) pairs to try per cycle (default: 200)
+- `goal_x`, `goal_y`: Target position
+- `goal_weight`, `heading_weight`, `smoothness_weight`, `obstacle_weight`: Scoring function coefficients
+- `robot_radius`, `safety_margin`: Inflation for collision checks
 
-Tests and CI
+### Developer Workflows & Debugging
 
-- Tests live under `src/dwa_local_planner/test/` and are ament/pytest helpers: `test_flake8.py`, `test_pep257.py`, etc. Use `colcon test` to run them in CI.
-- Linting and style: the project uses standard ament checks (flake8/pep257) via the test stubs. If you change imports or style, run the linters locally.
+**Fast iteration:**
+```bash
+colcon build --packages-select dwa_local_planner --symlink-install
+```
 
-Editing tips and safe changes
+**Inspect sensor data:**
+```bash
+ros2 topic echo /scan
+ros2 topic echo /odom
+ros2 topic echo /cmd_vel
+```
 
-- To change runtime parameters (goal, limits, dt): either edit the hardcoded values in `DWALocalPlanner.__init__` or (preferred) add ROS2 parameters and read them in `__init__` — the codebase currently uses hardcoded values.
-- When adding dependencies, add them to `package.xml` for ROS to resolve; only add to `setup.py` if you intend to publish a PyPI package.
-- Keep the node name stable: `super().__init__('dwa_local_planner')` — changing it affects topic names and logs.
+**Publish synthetic test messages:**
+```bash
+ros2 topic pub --once /scan sensor_msgs/msg/LaserScan "{ranges: [1.0, 1.0, ...]}"
+```
 
-Integration points
+**Run tests & linting:** Tests live in `src/dwa_local_planner/test/` (flake8, pep257 stubs). Status logged to stdout at 10 Hz (`control_loop`) and 1 Hz (`log_status`).
 
-- Publishes to `/cmd_vel` (Twist) and subscribes to `/odom` (Odometry) and `/scan` (LaserScan). Any change to topic names should be reflected in launch files or tests.
-- The code expects scans in robot frame with `angle_min`, `angle_increment` set; when integrating other sensors, ensure these fields are populated.
+### Conventions & Patterns (Project-Specific)
 
-## DWA Local Planner — Copilot Instructions
+1. **ROS2 Parameters:** All tunable values are declared via `declare_parameter(name, default)` and read via `get_parameter(name).value`. Avoid hardcoded constants in methods.
+2. **Sensor Preprocessing:** Always check for NaN/Inf in laser scans; transform to world frame using current odometry pose and `tf_transformations.euler_from_quaternion`.
+3. **Collision Safety:** `check_for_collisions` returns `None` (or large cost) if any trajectory point enters the inflation zone (robot_radius + safety_margin). Conservative by design.
+4. **Trajectory Representation:** Paths are lists of (x, y) tuples in world frame; collision checks run against precomputed world-frame scan points for efficiency.
+5. **Dependency Management:** Runtime deps go in `package.xml` (ament/ROS); `setup.py` only exposes console script entrypoints (`dwa_node`, `global_planner`).
 
-Purpose: concise, repo-specific guidance for AI coding agents to be productive quickly.
+### Safe Changes & Editing Tips
 
-- Repo layout: a ROS2 workspace with a single ament_python package at `src/dwa_local_planner`.
-- Language: Python 3 (uses `rclpy`, ROS message types, `numpy`).
+- **Add parameters:** Declare in `__init__`, read in relevant methods, document units and guidance in inline comments.
+- **Modify scoring function:** Adjust weights in `declare_parameter` calls; logic is in `control_loop`. Higher weight = higher priority.
+- **Change control loop rate:** Modify `self.create_timer(self.step_time, ...)` and ensure `step_time` parameter matches.
+- **Extend collision model:** Enhance `check_for_collisions` to handle additional geometry (e.g., costmaps) but preserve the "return None on collision" pattern.
 
-Quick commands (run from workspace root):
+### Integration Points
 
-- Build package: `colcon build --packages-select dwa_local_planner`
-- Source overlay after a successful build: `source install/setup.bash` (or `source install/local_setup.bash` for session-local)
-- Run node (once built and sourced): `ros2 run dwa_local_planner dwa_node`
-- Run tests: `colcon test --packages-select dwa_local_planner` && `colcon test-result --verbose`
+- **Topics:** Subscribes to `/odom` (Odometry), `/scan` (LaserScan); publishes `/cmd_vel` (Twist), `/visual_paths` (Marker).
+- **Launch file:** `src/dwa_local_planner/launch/dwa_gazebo.launch.py` wraps the node with Gazebo + RViz; see inline comments for tuning notes.
+- **Expected input format:** Scans must have `angle_min`, `angle_increment`, `ranges` fields; odometry must have valid pose (x, y, quaternion).
 
-Big picture
+### Key Files
+- `dwa_node.py` — Main planner and algorithm
+- `setup.py` — Console script: `dwa_node = dwa_local_planner.dwa_node:main`
+- `package.xml` — Runtime and test dependencies
+- `launch/dwa_gazebo.launch.py` — Integration with Gazebo
+- `test/` — Linting/style checks (flake8, pep257, copyright)
 
-- This repo is a compact demo of a Dynamic Window Approach local planner implemented as a single node: `DWALocalPlanner` in `dwa_node.py`.
-- Data flow: sensor `LaserScan` (`/scan`) -> planner (`predict_trajectory`, collision check) -> outputs `Twist` on `/cmd_vel`. The node also subscribes to `/odom` for current state.
-- Design rationale: single-file demo for clarity and easy experimentation — expect hardcoded params and simple Euler integration for trajectory prediction.
-
-Where to look first
-
-- `src/dwa_local_planner/dwa_local_planner/dwa_node.py`: the entire planner lives here. Key symbols:
-  - `class DWALocalPlanner(Node)` — subscriptions/publishers/timer and main loop.
-  - `self.goal = np.array([2.0, 0.0])` — quick demo goal; change here or convert to ROS parameters.
-  - `scan_cb` — converts `msg.ranges` to numpy and replaces NaN/Inf with `msg.range_max`.
-  - `predict_trajectory` — Euler integration to forward-simulate candidate velocities.
-  - collision-check logic maps scan angles to indices using `angle_min`/`angle_increment` and treats out-of-range as collision (conservative).
-
-Developer workflows & debugging
-
-- Build: `colcon build --packages-select dwa_local_planner` (use `--symlink-install` locally for faster iteration).
-- Source overlay: `source install/setup.bash` (or `source install/local_setup.bash`).
-- Run node: `ros2 run dwa_local_planner dwa_node`.
-- Debugging tips: use `ros2 topic echo /scan` and `ros2 topic echo /odom` to inspect inputs; `ros2 topic echo /cmd_vel` to verify outputs. Use `ros2 topic pub` to publish synthetic messages for unit tests.
-- Tests & lint: tests are in `src/dwa_local_planner/test/` (ament/pytest stubs include `test_flake8.py`, `test_pep257.py`). Run `colcon test` and check `colcon test-result --verbose`.
-
-Conventions & repo-specific patterns
-
-- Keep `rclpy.Node` idioms: use `create_subscription`, `create_publisher`, `create_timer` patterns as present in `dwa_node.py`.
-- Sensor preprocessing: always normalize `msg.ranges` to a numpy array and replace NaN/Inf with `msg.range_max` (see `scan_cb`).
-- Safety-first collision model: out-of-range or missing scan indices are treated as collisions — preserve this when refactoring.
-- Dependency management: add runtime deps to `package.xml` (ROS/ament). `setup.py` only exposes the console script entrypoint.
-
-When changing behavior
-
-- Prefer adding ROS2 parameters (read in `__init__`) instead of editing hardcoded constants in-place.
-- Update or add unit tests in `src/dwa_local_planner/test/` when altering planner logic.
-
-Key files
-
-- `src/dwa_local_planner/dwa_local_planner/dwa_node.py` — main node and algorithm.
-- `src/dwa_local_planner/package.xml` — ament/ROS dependencies.
-- `src/dwa_local_planner/setup.py` — console script entry: `dwa_node = dwa_local_planner.dwa_node:main`.
-- `src/dwa_local_planner/test/` — test stubs (linting + style checks).
-
-If any section is missing details you'd like (examples: turning hardcoded values into ROS parameters, adding a launch file, or a unit test example for `predict_trajectory`), tell me which area to expand and I'll iterate.
+### Documentation References
+- **Tuning guide:** `DWA_TUNING_GUIDE.md` — Detailed parameter tuning and common issues
+- **Usage guide:** `USAGE_GUIDE.md` — Two-layer navigation (global + local planner) workflow
+- **Launch file:** `LAUNCH.md` — Launch file configuration details
